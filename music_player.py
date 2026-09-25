@@ -94,9 +94,13 @@ class YTDLSource:
     async def extract_info(cls, query: str, download: bool = False):
         """Extract metadata asynchronously."""
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, lambda: ytdl.extract_info(query, download=download)
-        )
+        try:
+            return await loop.run_in_executor(
+                None, lambda: ytdl.extract_info(query, download=download)
+            )
+        except Exception as e:
+            logger.error(f"yt-dlp extract_info error untuk query '{query}': {e}")
+            return None
 
     @classmethod
     async def search_tracks(cls, query: str, max_results: int = 5) -> List[dict]:
@@ -113,23 +117,30 @@ class YTDLSource:
         is_url = query.startswith("http://") or query.startswith("https://")
         search_query = query if is_url else f"ytsearch1:{query}"
 
-        data = await cls.extract_info(search_query, download=False)
-        if not data:
+        try:
+            data = await cls.extract_info(search_query, download=False)
+            if not data:
+                return None
+
+            # Jika hasil pencarian berupa list entries
+            if "entries" in data and data["entries"]:
+                data = data["entries"][0]
+
+            if not data or not data.get("url"):
+                return None
+
+            return Song(
+                title=data.get("title", "Unknown Title"),
+                url=data.get("url"),
+                webpage_url=data.get("webpage_url", query),
+                duration=data.get("duration"),
+                thumbnail=data.get("thumbnail"),
+                uploader=data.get("uploader", "Unknown Artist"),
+                requester=requester,
+            )
+        except Exception as e:
+            logger.error(f"Error parsing data lagu: {e}")
             return None
-
-        # Jika hasil pencarian berupa list entries
-        if "entries" in data and data["entries"]:
-            data = data["entries"][0]
-
-        return Song(
-            title=data.get("title", "Unknown Title"),
-            url=data.get("url"),
-            webpage_url=data.get("webpage_url", query),
-            duration=data.get("duration"),
-            thumbnail=data.get("thumbnail"),
-            uploader=data.get("uploader", "Unknown Artist"),
-            requester=requester,
-        )
 
 
 class InterruptableVolumeTransformer(discord.PCMVolumeTransformer):

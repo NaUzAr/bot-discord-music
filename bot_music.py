@@ -269,10 +269,11 @@ def play_next_song(guild_id: int):
 async def ensure_voice_connection(interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
     """Helper untuk memastikan bot dan user berada di voice channel."""
     if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message(
-            "❌ Kamu harus masuk ke voice channel terlebih dahulu!",
-            ephemeral=True,
-        )
+        msg = "❌ Kamu harus masuk ke voice channel terlebih dahulu!"
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
         return None
 
     user_channel = interaction.user.voice.channel
@@ -281,20 +282,40 @@ async def ensure_voice_connection(interaction: discord.Interaction) -> Optional[
 
     if not vc or not vc.is_connected():
         try:
-            vc = await user_channel.connect(self_deaf=False)
+            vc = await user_channel.connect(self_deaf=False, timeout=20.0)
             bot.voice_clients_dict[guild_id] = vc
             bot.target_channels[guild_id] = user_channel.id
             bot.connected_since[guild_id] = datetime.now(timezone.utc)
         except Exception as e:
-            await interaction.response.send_message(
-                f"❌ Gagal bergabung ke voice channel: {e}", ephemeral=True
-            )
+            logger.error(f"Gagal bergabung ke voice channel: {e}", exc_info=True)
+            msg = f"❌ Gagal bergabung ke voice channel: `{e}`"
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
             return None
     elif vc.channel.id != user_channel.id:
-        await vc.move_to(user_channel)
-        bot.target_channels[guild_id] = user_channel.id
+        try:
+            await vc.move_to(user_channel)
+            bot.target_channels[guild_id] = user_channel.id
+        except Exception as e:
+            logger.error(f"Gagal berpindah ke channel {user_channel.name}: {e}")
 
     return vc
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Global handler agar slash command tidak hang di 'thinking...' jika ada error tak terduga."""
+    logger.error(f"Unhandled slash command error: {error}", exc_info=error)
+    msg = f"❌ Terjadi kesalahan saat menjalankan perintah: `{error}`"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 
 # ─── Slash Commands: Music ───────────────────────────────────────────
@@ -303,35 +324,39 @@ async def ensure_voice_connection(interaction: discord.Interaction) -> Optional[
 async def cmd_play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
 
-    vc = await ensure_voice_connection(interaction)
-    if not vc:
-        return
+    try:
+        vc = await ensure_voice_connection(interaction)
+        if not vc:
+            return
 
-    guild_id = interaction.guild.id
-    queue = bot.get_queue(guild_id)
-    queue.text_channel = interaction.channel
+        guild_id = interaction.guild.id
+        queue = bot.get_queue(guild_id)
+        queue.text_channel = interaction.channel
 
-    song = await YTDLSource.get_song(query, interaction.user)
-    if not song:
-        await interaction.followup.send(f"❌ Tidak dapat menemukan lagu untuk: `{query}`")
-        return
+        song = await YTDLSource.get_song(query, interaction.user)
+        if not song:
+            await interaction.followup.send(f"❌ Tidak dapat menemukan atau memutar lagu untuk: `{query}`")
+            return
 
-    queue.add(song)
+        queue.add(song)
 
-    if not vc.is_playing() and not vc.is_paused():
-        play_next_song(guild_id)
-        await interaction.followup.send(f"▶️ Memutar: **{song.title}**")
-    else:
-        embed = discord.Embed(
-            title="📥 Ditambahkan ke Antrean",
-            description=f"[{song.title}]({song.webpage_url})",
-            color=discord.Color.green(),
-        )
-        embed.add_field(name="Durasi", value=song.duration_str, inline=True)
-        embed.add_field(name="Posisi Antrean", value=f"#{len(queue.queue)}", inline=True)
-        if song.thumbnail:
-            embed.set_thumbnail(url=song.thumbnail)
-        await interaction.followup.send(embed=embed)
+        if not vc.is_playing() and not vc.is_paused():
+            play_next_song(guild_id)
+            await interaction.followup.send(f"▶️ Memutar: **{song.title}**")
+        else:
+            embed = discord.Embed(
+                title="📥 Ditambahkan ke Antrean",
+                description=f"[{song.title}]({song.webpage_url})",
+                color=discord.Color.green(),
+            )
+            embed.add_field(name="Durasi", value=song.duration_str, inline=True)
+            embed.add_field(name="Posisi Antrean", value=f"#{len(queue.queue)}", inline=True)
+            if song.thumbnail:
+                embed.set_thumbnail(url=song.thumbnail)
+            await interaction.followup.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Error pada cmd_play: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ Terjadi kesalahan saat memproses lagu: `{e}`")
 
 
 @bot.tree.command(name="search", description="🔍 Cari 5 pilihan lagu dan pilih via menu dropdown")
@@ -339,40 +364,44 @@ async def cmd_play(interaction: discord.Interaction, query: str):
 async def cmd_search(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
 
-    vc = await ensure_voice_connection(interaction)
-    if not vc:
-        return
+    try:
+        vc = await ensure_voice_connection(interaction)
+        if not vc:
+            return
 
-    tracks = await YTDLSource.search_tracks(query, max_results=5)
-    if not tracks:
-        await interaction.followup.send(f"❌ Tidak ada hasil untuk: `{query}`")
-        return
+        tracks = await YTDLSource.search_tracks(query, max_results=5)
+        if not tracks:
+            await interaction.followup.send(f"❌ Tidak ada hasil untuk: `{query}`")
+            return
 
-    guild_id = interaction.guild.id
-    queue = bot.get_queue(guild_id)
-    queue.text_channel = interaction.channel
+        guild_id = interaction.guild.id
+        queue = bot.get_queue(guild_id)
+        queue.text_channel = interaction.channel
 
-    async def on_song_selected(inter: discord.Interaction, song: Song, view: SearchSelectView):
-        queue.add(song)
-        if not vc.is_playing() and not vc.is_paused():
-            play_next_song(guild_id)
-            await inter.response.edit_message(
-                content=f"▶️ Memutar: **{song.title}** ({song.duration_str})",
-                view=view,
-            )
-        else:
-            await inter.response.edit_message(
-                content=f"📥 Ditambahkan ke antrean: **{song.title}** (#{len(queue.queue)})",
-                view=view,
-            )
+        async def on_song_selected(inter: discord.Interaction, song: Song, view: SearchSelectView):
+            queue.add(song)
+            if not vc.is_playing() and not vc.is_paused():
+                play_next_song(guild_id)
+                await inter.response.edit_message(
+                    content=f"▶️ Memutar: **{song.title}** ({song.duration_str})",
+                    view=view,
+                )
+            else:
+                await inter.response.edit_message(
+                    content=f"📥 Ditambahkan ke antrean: **{song.title}** (#{len(queue.queue)})",
+                    view=view,
+                )
 
-    view = SearchSelectView(tracks, interaction.user, on_song_selected)
-    embed = discord.Embed(
-        title="🔍 Hasil Pencarian Lagu",
-        description=f"Ditemukan 5 lagu untuk `{query}`. Pilih lagu dari menu dropdown di bawah:",
-        color=discord.Color.blurple(),
-    )
-    await interaction.followup.send(embed=embed, view=view)
+        view = SearchSelectView(tracks, interaction.user, on_song_selected)
+        embed = discord.Embed(
+            title="🔍 Hasil Pencarian Lagu",
+            description=f"Ditemukan 5 lagu untuk `{query}`. Pilih lagu dari menu dropdown di bawah:",
+            color=discord.Color.blurple(),
+        )
+        await interaction.followup.send(embed=embed, view=view)
+    except Exception as e:
+        logger.error(f"Error pada cmd_search: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ Terjadi kesalahan saat mencari lagu: `{e}`")
 
 
 @bot.tree.command(name="skip", description="⏭️ Lewati lagu yang sedang diputar")
