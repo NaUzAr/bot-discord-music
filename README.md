@@ -26,7 +26,7 @@ Bot Discord lengkap dengan fitur musik ala Rythm, penjaga voice channel 24/7 (*K
 4. **🏆 Voice Activity Tracker & Leaderboard**
    - `/voicetop`: Papan peringkat member teraktif di voice channel.
    - `/voicetime`: Cek total waktu nongkrong dan ranking diri sendiri atau member lain.
-   - **Anti-AFK & Deaf Filter**: Otomatis mengabaikan member yang sedang *deafened* (tuli) atau sendirian di room kosong untuk mencegah kecurangan farming waktu.
+   - **Deaf & AFK Filter**: Otomatis mengabaikan member yang sedang *deafened* (tuli) atau berada di voice channel AFK server. Durasi voice tetap tercatat meskipun user sendirian tanpa bot harus join ke room.
    - **Async SQLite (`aiosqlite`)**: Non-blocking database I/O untuk performa tinggi.
 
 5. **🤖 AI Smart Playlist & Recommendations (Google Gemini)**

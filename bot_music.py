@@ -455,13 +455,17 @@ class RythmVoiceBot(discord.Client):
     async def flush_voice_activity_loop(self):
         """
         Simpan akumulasi waktu voice setiap 60 detik secara berkala.
-        Anti-AFK & Deaf Filter:
-        1. User tidak sedang self_deaf atau server deaf.
-        2. Channel tidak kosong (ada minimal 2 member manusia, ATAU 1 manusia bersama bot).
+        - Bot tidak wajib join ke voice channel (dideteksi via gateway).
+        - Member sendirian tetap dihitung waktunya.
+        - Filter: bukan bot, tidak deaf, dan bukan di channel AFK server.
         """
         entries_to_add = []
         for guild in self.guilds:
             for channel in guild.voice_channels:
+                # Abaikan channel AFK server jika ada
+                if guild.afk_channel and channel.id == guild.afk_channel.id:
+                    continue
+
                 # Filter anggota manusia yang aktif (tidak deaf)
                 active_humans = [
                     m for m in channel.members
@@ -469,11 +473,6 @@ class RythmVoiceBot(discord.Client):
                 ]
 
                 if not active_humans:
-                    continue
-
-                # Cek apakah sendirian di room kosong tanpa bot (mencegah farming AFK sendirian)
-                bot_in_channel = any(m.id == self.user.id for m in channel.members)
-                if len(active_humans) < 2 and not bot_in_channel:
                     continue
 
                 for member in active_humans:
