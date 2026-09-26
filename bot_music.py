@@ -904,7 +904,10 @@ async def handle_autoplay(guild_id: int):
         history_to_analyze = queue.recent_history[-5:] if queue.recent_history else ([queue.last_played] if queue.last_played else [])
         if history_to_analyze:
             try:
-                ai_rec = await recommend_next_song(history_to_analyze)
+                played_titles = [s.title for s in queue.recent_history if s and s.title]
+                if queue.last_played and queue.last_played.title:
+                    played_titles.append(queue.last_played.title)
+                ai_rec = await recommend_next_song(history_to_analyze, played_titles=played_titles)
                 if ai_rec and ai_rec.get("title") and ai_rec.get("artist"):
                     # Buat daftar kandidat: Rekomendasi utama + alternatif cadangan
                     candidates = [ai_rec]
@@ -943,7 +946,10 @@ async def handle_autoplay(guild_id: int):
         clean_title = re.sub(r"[\[\(].*?[\]\)]", "", title).strip()
         uploader = queue.last_played.uploader or ""
         if uploader and uploader.lower() not in ["unknown artist", "youtube"]:
-            query = f"{uploader} {clean_title} songs"
+            if uploader.lower() in clean_title.lower():
+                query = f"{clean_title} songs"
+            else:
+                query = f"{uploader} {clean_title} songs"
         else:
             query = f"{clean_title} songs"
         logger.info(f"📻 AutoPlay rekomendasi mencari lagu: '{query}'")

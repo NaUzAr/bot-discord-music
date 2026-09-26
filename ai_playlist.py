@@ -125,7 +125,10 @@ def _clean_track_title(raw_title: str) -> str:
     return cleaned or raw_title
 
 
-async def recommend_next_song(recent_songs: List[Any]) -> Optional[Dict[str, Any]]:
+async def recommend_next_song(
+    recent_songs: List[Any],
+    played_titles: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
     """
     Menganalisis riwayat lagu terakhir dengan standar Music Director profesional.
     Menghasilkan rekomendasi utama berkelas dan 2 lagu cadangan (alternatives).
@@ -141,10 +144,17 @@ async def recommend_next_song(recent_songs: List[Any]) -> Optional[Dict[str, Any
         uploader = getattr(s, "uploader", "") or "Unknown"
         recent_list_text += f'{i}. "{clean_title}" (Judul asli: {raw_title}, Channel: {uploader})\n'
 
+    played_note = ""
+    if played_titles:
+        clean_played = list(dict.fromkeys([_clean_track_title(t) for t in played_titles[-10:] if t]))
+        if clean_played:
+            played_note = "\nDAFTAR LAGU YANG SUDAH PERNAH DIPUTAR DI SESI INI (DILARANG DIREKOMENDASIKAN LAGI):\n" + "\n".join(f"- {t}" for t in clean_played) + "\n"
+
     prompt = (
         "Kamu adalah seorang AI Music Director & DJ Kurator Kelas Dunia dengan selera musik (taste) yang sangat tinggi.\n"
         "Di sebuah room voice Discord, pengguna baru saja mendengarkan lagu-lagu berikut:\n\n"
         f"{recent_list_text}\n"
+        f"{played_note}\n"
         "PETUNJUK ANALISIS & KURASI (HARUS DIPATUHI):\n"
         "1. IDENTIFIKASI ARTIS ASLI:\n"
         "   Data di atas diambil dari YouTube. Nama channel/uploader sering kali adalah nama label rekaman (contoh: 'HITS Records', 'Musica Studios', 'Vevo', 'Aquarius') "
@@ -163,9 +173,11 @@ async def recommend_next_song(recent_songs: List[Any]) -> Optional[Dict[str, Any
         "   - Jika lagu Barat/English, rekomendasikan lagu Barat. Jangan mencampur bahasa tanpa alasan musikal yang kuat.\n\n"
         "4. KONSISTENSI TEMPO & MOOD (ENERGY MATCHING):\n"
         "   - Jaga agar transisi lagu tidak mengagetkan pendengar. Jangan melompat drastis dari lagu akustik syahdu lambat ke lagu party bertempo cepat.\n\n"
-        "5. PILIHAN UTAMA & 2 ALTERNATIF CADANGAN:\n"
+        "5. DILARANG MENGULANG LAGU:\n"
+        "   - Lagu rekomendasi utama maupun kedua lagu alternatif TIDAK BOLEH mengulang lagu yang ada di riwayat atau daftar yang sudah pernah diputar.\n\n"
+        "6. PILIHAN UTAMA & 2 ALTERNATIF CADANGAN:\n"
         "   - Berikan 1 rekomendasi terbaik (title, artist, theme, reason).\n"
-        "   - Berikan 2 alternatif lagu lain yang sama-sama cocok jika lagu utama sudah pernah diputar.\n"
+        "   - Berikan 2 alternatif lagu lain yang sama-sama cocok dari artis berbeda jika lagu utama sudah pernah diputar.\n"
         "   - Semua lagu HARUS LAGU NYATA dan TERKENAL yang pasti ada di YouTube.\n\n"
         "FORMAT OUTPUT (HANYA JSON MURNI TANPA MARKDOWN ATAU PENJELASAN LAIN):\n"
         "{\n"
