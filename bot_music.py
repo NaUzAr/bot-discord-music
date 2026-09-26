@@ -150,6 +150,58 @@ def add_safe_fields(
         embed.add_field(name=field_name, value=chunk, inline=inline)
 
 
+def build_now_playing_embed(
+    song: Song,
+    queue: GuildMusicQueue,
+    voice_client: Optional[discord.VoiceClient] = None,
+    connected_since: Optional[datetime] = None,
+) -> discord.Embed:
+    """Membangun embed informasi Now Playing pemutar musik."""
+    artist_display = song.uploader if song.uploader and song.uploader != "Unknown Artist" else "Unknown Artist"
+    progress = make_progress_bar()
+
+    embed = discord.Embed(
+        title="",
+        description=(
+            f"### 🎶 Sedang Memutar\n"
+            f"**[{song.title}]({song.webpage_url})**\n"
+            f"oleh **{artist_display}**\n\n"
+            f"{progress}\n"
+            f"`⏱️ {song.duration_str}`"
+        ),
+        color=Theme.PLAYING,
+    )
+    if song.thumbnail:
+        embed.set_thumbnail(url=song.thumbnail)
+
+    # Status bar kompak
+    loop_icon = "🔁" if queue.is_looping else "➡️"
+    autoplay_icon = "📻" if queue.autoplay else "⏹️"
+    vol_pct = int(queue.volume * 100)
+    status_parts = [f"🔊 `{vol_pct}%`", f"{loop_icon} Loop", f"{autoplay_icon} AutoPlay"]
+
+    genre_data = GENRE_PLAYLISTS.get(queue.autoplay_genre) if queue.autoplay_genre else None
+    if genre_data:
+        status_parts.append(f"{genre_data['emoji']} {genre_data['name']}")
+
+    if queue.audio_filter and queue.audio_filter in AUDIO_FILTERS:
+        flt_data = AUDIO_FILTERS[queue.audio_filter]
+        status_parts.append(f"{flt_data['emoji']} {flt_data['name']}")
+
+    embed.add_field(name="", value=" **·** ".join(status_parts), inline=False)
+    if song.requester:
+        embed.add_field(name="Diminta oleh", value=song.requester.mention, inline=True)
+    if queue.queue:
+        embed.add_field(name="Antrean", value=f"`{len(queue.queue)} lagu`", inline=True)
+
+    footer_parts = [f"Volume: {vol_pct}%"]
+    if genre_data:
+        footer_parts.append(f"📻 {genre_data['name']}")
+    if queue.audio_filter and queue.audio_filter in AUDIO_FILTERS:
+        footer_parts.append(f"🎛️ {AUDIO_FILTERS[queue.audio_filter]['name']}")
+    embed.set_footer(text=f"{'  ·  '.join(footer_parts)}  •  {Theme.BRAND_NAME}")
+    return embed
+
 
 class RythmVoiceBot(discord.Client):
     """Bot musik serbaguna dengan 24/7 voice stay, Pomodoro, dan Voice Tracker."""
@@ -1106,49 +1158,12 @@ def play_next_song(guild_id: int):
 
         # Kirim embed Now Playing — Desain Premium
         if queue.text_channel:
-            artist_display = song.uploader if song.uploader and song.uploader != "Unknown Artist" else "Unknown Artist"
-            progress = make_progress_bar()
-
-            embed = discord.Embed(
-                title="",
-                description=(
-                    f"### 🎶 Sedang Memutar\n"
-                    f"**[{song.title}]({song.webpage_url})**\n"
-                    f"oleh **{artist_display}**\n\n"
-                    f"{progress}\n"
-                    f"`⏱️ {song.duration_str}`"
-                ),
-                color=Theme.PLAYING,
+            embed = build_now_playing_embed(
+                song=song,
+                queue=queue,
+                voice_client=vc,
+                connected_since=bot.connected_since.get(guild_id),
             )
-            if song.thumbnail:
-                embed.set_thumbnail(url=song.thumbnail)
-
-            # Status bar kompak
-            loop_icon = "🔁" if queue.is_looping else "➡️"
-            autoplay_icon = "📻" if queue.autoplay else "⏹️"
-            vol_pct = int(queue.volume * 100)
-            status_parts = [f"🔊 `{vol_pct}%`", f"{loop_icon} Loop", f"{autoplay_icon} AutoPlay"]
-
-            genre_data = GENRE_PLAYLISTS.get(queue.autoplay_genre) if queue.autoplay_genre else None
-            if genre_data:
-                status_parts.append(f"{genre_data['emoji']} {genre_data['name']}")
-
-            if queue.audio_filter and queue.audio_filter in AUDIO_FILTERS:
-                flt_data = AUDIO_FILTERS[queue.audio_filter]
-                status_parts.append(f"{flt_data['emoji']} {flt_data['name']}")
-
-            embed.add_field(name="", value=" **·** ".join(status_parts), inline=False)
-            embed.add_field(name="Diminta oleh", value=song.requester.mention, inline=True)
-            if queue.queue:
-                embed.add_field(name="Antrean", value=f"`{len(queue.queue)} lagu`", inline=True)
-
-            footer_parts = [f"Volume: {vol_pct}%"]
-            if genre_data:
-                footer_parts.append(f"📻 {genre_data['name']}")
-            if queue.audio_filter and queue.audio_filter in AUDIO_FILTERS:
-                footer_parts.append(f"🎛️ {AUDIO_FILTERS[queue.audio_filter]['name']}")
-            embed.set_footer(text=f"{'  ·  '.join(footer_parts)}  •  {Theme.BRAND_NAME}")
-
             view = MusicControlView(guild_id, bot)
             asyncio.run_coroutine_threadsafe(
                 queue.text_channel.send(embed=embed, view=view), bot.loop
@@ -1734,41 +1749,12 @@ async def cmd_nowplaying(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Tidak ada lagu yang sedang diputar!", ephemeral=True)
         return
 
-    song = queue.current
-    artist_display = song.uploader if song.uploader and song.uploader != "Unknown Artist" else "Unknown Artist"
-    progress = make_progress_bar()
-
-    embed = discord.Embed(
-        title="",
-        description=(
-            f"### 🎧 Now Playing\n"
-            f"{Theme.SEPARATOR_THIN}\n\n"
-            f"**[{song.title}]({song.webpage_url})**\n"
-            f"oleh **{artist_display}**\n\n"
-            f"{progress}\n"
-            f"`⏱️ {song.duration_str}`"
-        ),
-        color=Theme.PLAYING,
+    embed = build_now_playing_embed(
+        song=queue.current,
+        queue=queue,
+        voice_client=bot.get_guild_voice_client(interaction.guild.id),
+        connected_since=bot.connected_since.get(interaction.guild.id),
     )
-    if song.thumbnail:
-        embed.set_image(url=song.thumbnail)
-
-    # Status bar
-    vol_pct = int(queue.volume * 100)
-    loop_icon = "🔁" if queue.is_looping else "➡️"
-    autoplay_icon = "📻" if queue.autoplay else "⏹️"
-    status_parts = [f"🔊 `{vol_pct}%`", f"{loop_icon} Loop", f"{autoplay_icon} AutoPlay"]
-
-    genre_data = GENRE_PLAYLISTS.get(queue.autoplay_genre) if queue.autoplay_genre else None
-    if genre_data:
-        status_parts.append(f"{genre_data['emoji']} {genre_data['name']}")
-
-    embed.add_field(name="", value=" **·** ".join(status_parts), inline=False)
-    embed.add_field(name="Diminta oleh", value=song.requester.mention, inline=True)
-    if queue.queue:
-        embed.add_field(name="Antrean", value=f"`{len(queue.queue)} lagu`", inline=True)
-
-    embed.set_footer(text=f"Volume: {vol_pct}%  •  {Theme.BRAND_NAME}")
     view = MusicControlView(interaction.guild.id, bot)
     await interaction.response.send_message(embed=embed, view=view)
 
