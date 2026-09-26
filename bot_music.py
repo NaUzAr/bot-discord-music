@@ -105,13 +105,6 @@ def styled_embed(
     return embed
 
 
-def make_progress_bar(current_label: str = "▶️", length: int = 16) -> str:
-    """Membuat visual bar dekoratif untuk Now Playing."""
-    filled = random.randint(3, length - 3)
-    bar = "▬" * filled + "🔘" + "▬" * (length - filled - 1)
-    return f"`{bar}`"
-
-
 def add_safe_fields(
     embed: discord.Embed,
     name: str,
@@ -158,15 +151,11 @@ def build_now_playing_embed(
 ) -> discord.Embed:
     """Membangun embed Now Playing yang bersih, sederhana, dan rapi."""
     artist_display = song.uploader if song.uploader and song.uploader != "Unknown Artist" else None
-    artist_text = f"oleh **{artist_display}**\n" if artist_display else ""
-    progress = make_progress_bar()
+    artist_text = f"oleh **{artist_display}**" if artist_display else ""
 
-    desc = (
-        f"**[{song.title}]({song.webpage_url})**\n"
-        f"{artist_text}\n"
-        f"{progress}\n"
-        f"`⏱️ {song.duration_str}`"
-    )
+    desc = f"**[{song.title}]({song.webpage_url})**"
+    if artist_text:
+        desc += f"\n{artist_text}"
 
     embed = discord.Embed(
         title="🎶 Sedang Memutar",
@@ -178,13 +167,13 @@ def build_now_playing_embed(
 
     # Info status sederhana dalam 1 baris
     auto_status = "ON" if queue.autoplay else "OFF"
-    info_items = [f"📻 Auto: `{auto_badge}`" if (auto_badge := auto_status) else ""]
+    info_items = [f"⏱️ `{song.duration_str}`", f"📻 Auto: `{auto_status}`"]
     if queue.queue:
         info_items.append(f"📜 Antrean: `{len(queue.queue)}`")
     if song.requester:
         info_items.append(f"Diminta oleh {song.requester.mention}")
 
-    embed.add_field(name="", value="  •  ".join([item for item in info_items if item]), inline=False)
+    embed.add_field(name="", value="  •  ".join(info_items), inline=False)
     embed.set_footer(text=Theme.BRAND_NAME)
     return embed
 
