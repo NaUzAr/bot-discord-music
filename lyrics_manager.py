@@ -218,7 +218,7 @@ class LyricsPaginationView(discord.ui.View):
         if self.thumbnail:
             embed.set_thumbnail(url=self.thumbnail)
         embed.set_footer(
-            text=f"Sumber: {self.source}  •  Diminta oleh {self.requester.display_name}  •  🎵 Rythm Voice Companion",
+            text=f"Sumber: {self.source}  •  Diminta oleh {self.requester.display_name}  •  Voice Companion",
             icon_url=self.requester.display_avatar.url,
         )
         return embed

@@ -80,7 +80,7 @@ class Theme:
     POMODORO_B = 0x27AE60  # Hijau — istirahat
     IDLE       = 0x95A5A6  # Abu — idle
     LEADERBOARD = 0xF1C40F # Kuning — leaderboard
-    BRAND_NAME = "🎵 Rythm Voice Companion"
+    BRAND_NAME = "Voice Companion"
     SEPARATOR  = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     SEPARATOR_THIN = "─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─"
 
