@@ -262,6 +262,8 @@ class Song:
     thumbnail: Optional[str]
     uploader: str
     requester: Any
+    is_podcast: bool = False
+    ai_context: Optional[dict] = None
 
     @property
     def duration_str(self) -> str:
@@ -293,7 +295,13 @@ class YTDLSource:
         return [entry for entry in data["entries"] if entry]
 
     @classmethod
-    async def get_song(cls, query: str, requester: Any) -> Optional[Song]:
+    async def get_song(
+        cls,
+        query: str,
+        requester: Any,
+        is_podcast: bool = False,
+        ai_context: Optional[dict] = None,
+    ) -> Optional[Song]:
         """Mendapatkan single song dari URL atau keyword pencarian."""
         is_url = query.startswith("http://") or query.startswith("https://")
         search_query = query if is_url else f"ytsearch1:{query}"
@@ -318,6 +326,8 @@ class YTDLSource:
                 thumbnail=data.get("thumbnail"),
                 uploader=data.get("uploader", "Unknown Artist"),
                 requester=requester,
+                is_podcast=is_podcast,
+                ai_context=ai_context,
             )
         except Exception as e:
             logger.error(f"Error parsing data lagu: {e}")

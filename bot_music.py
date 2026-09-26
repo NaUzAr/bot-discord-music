@@ -40,6 +40,12 @@ from pomodoro import PomodoroManager
 from ai_playlist import generate_ai_playlist, recommend_next_song
 from lyrics_manager import get_lyrics, chunk_lyrics, LyricsPaginationView, clean_song_title
 from sleep_timer import SleepTimerManager, SleepTimerSession, SleepTimerSelectView
+from podcast_manager import (
+    PODCAST_CATEGORIES,
+    search_podcast_episodes,
+    PodcastSelectView,
+    PodcastCategoryView,
+)
 
 import sys
 
@@ -157,13 +163,30 @@ def build_now_playing_embed(
     if artist_text:
         desc += f"\n{artist_text}"
 
+    is_pod = getattr(song, "is_podcast", False)
+    header_title = "🎙️ Sedang Mengudara (Podcast)" if is_pod else "🎶 Sedang Memutar"
+    embed_color = Theme.RADIO if is_pod else Theme.PLAYING
+
     embed = discord.Embed(
-        title="🎶 Sedang Memutar",
+        title=header_title,
         description=desc,
-        color=Theme.PLAYING,
+        color=embed_color,
     )
     if song.thumbnail:
         embed.set_thumbnail(url=song.thumbnail)
+
+    # Info kurasi AI jika lagu diputar via rekomendasi AI AutoPlay
+    ai_ctx = getattr(song, "ai_context", None)
+    if ai_ctx and isinstance(ai_ctx, dict):
+        theme_str = ai_ctx.get("theme", "")
+        reason_str = ai_ctx.get("reason", "")
+        ai_desc = []
+        if theme_str:
+            ai_desc.append(f"🏷️ **Vibe:** `{theme_str}`")
+        if reason_str:
+            ai_desc.append(f"💡 *\"{reason_str}\"*")
+        if ai_desc:
+            embed.add_field(name="🤖 Rekomendasi AI AutoPlay", value="\n".join(ai_desc), inline=False)
 
     # Info status sederhana dalam 1 baris
     auto_status = "ON" if queue.autoplay else "OFF"
@@ -883,14 +906,31 @@ async def handle_autoplay(guild_id: int):
             try:
                 ai_rec = await recommend_next_song(history_to_analyze)
                 if ai_rec and ai_rec.get("title") and ai_rec.get("artist"):
-                    search_str = f"{ai_rec.get('artist')} {ai_rec.get('title')}".strip()
-                    logger.info(f"🤖 AI AutoPlay merekomendasikan: '{search_str}' (Tema: {ai_rec.get('theme')})")
-                    ai_song = await YTDLSource.get_song(search_str, requester=bot.user)
-                    if ai_song and ai_song.webpage_url not in queue.played_history:
-                        queue.add(ai_song)
-                        if not vc.is_playing() and not vc.is_paused():
-                            play_next_song(guild_id)
-                        return
+                    # Buat daftar kandidat: Rekomendasi utama + alternatif cadangan
+                    candidates = [ai_rec]
+                    if "alternatives" in ai_rec and isinstance(ai_rec["alternatives"], list):
+                        candidates.extend(ai_rec["alternatives"])
+
+                    for cand in candidates:
+                        c_title = cand.get("title")
+                        c_artist = cand.get("artist")
+                        if not c_title or not c_artist:
+                            continue
+                        search_str = f"{c_artist} {c_title}".strip()
+                        logger.info(f"🤖 AI AutoPlay mencoba rekomendasi: '{search_str}'")
+                        ai_song = await YTDLSource.get_song(
+                            search_str,
+                            requester=bot.user,
+                            ai_context={
+                                "theme": ai_rec.get("theme", "Rekomendasi AI"),
+                                "reason": ai_rec.get("reason", "Melanjutkan vibe lagu sebelumnya."),
+                            },
+                        )
+                        if ai_song and ai_song.webpage_url not in queue.played_history:
+                            queue.add(ai_song)
+                            if not vc.is_playing() and not vc.is_paused():
+                                play_next_song(guild_id)
+                            return
             except Exception as e:
                 logger.warning(f"AI AutoPlay context error (fallback to search): {e}")
 
@@ -1584,6 +1624,154 @@ async def cmd_radio(
 @bot.tree.command(name="genre", description="📻 Buka menu pilihan genre lagu (Auto-Playlist)")
 async def cmd_genre(interaction: discord.Interaction):
     await execute_radio(interaction, None)
+
+
+@bot.tree.command(name="podcast", description="🎙️ Dengarkan podcast populer, cari topik, atau trending minggu ini")
+@app_commands.choices(
+    kategori=[
+        app_commands.Choice(name="🔥 Trending Minggu Ini (Talkshow & Populer)", value="trending"),
+        app_commands.Choice(name="😂 Komedi & Obrolan Santai (PWK, Agak Laen, Vindes)", value="komedi"),
+        app_commands.Choice(name="👻 Cerita Horor & Misteri (Lentera Malam, RJL 5)", value="horor"),
+        app_commands.Choice(name="🧠 Bisnis, Karir & Edukasi (Endgame, Raymond)", value="bisnis"),
+        app_commands.Choice(name="🌍 Global & Science (Joe Rogan, Huberman Lab)", value="global"),
+    ]
+)
+@app_commands.describe(
+    kategori="Pilih kategori podcast trending minggu ini",
+    cari="Cari topik atau channel podcast spesifik (misal: 'Agak Laen Boris', 'AI Masa Depan')"
+)
+async def cmd_podcast(
+    interaction: discord.Interaction,
+    kategori: Optional[app_commands.Choice[str]] = None,
+    cari: Optional[str] = None,
+):
+    await interaction.response.defer()
+    vc = await ensure_voice_connection(interaction)
+    if not vc:
+        return
+
+    guild_id = interaction.guild.id
+    queue = bot.get_queue(guild_id)
+    queue.text_channel = interaction.channel
+
+    async def on_episode_chosen(inter: discord.Interaction, ep: dict, view_instance):
+        for item in view_instance.children:
+            item.disabled = True
+        try:
+            await inter.response.edit_message(view=view_instance)
+        except Exception:
+            pass
+
+        target_url = ep.get("url")
+        song = await YTDLSource.get_song(target_url, requester=interaction.user, is_podcast=True)
+        if not song:
+            await inter.followup.send(f"❌ Gagal memuat audio podcast: **{ep['title']}**", ephemeral=True)
+            return
+
+        queue.add(song)
+        if not vc.is_playing() and not vc.is_paused():
+            play_next_song(guild_id, notify_channel=False)
+            embed = build_now_playing_embed(
+                song=song,
+                queue=queue,
+                voice_client=vc,
+                connected_since=bot.connected_since.get(guild_id),
+            )
+            ctrl_view = MusicControlView(guild_id, bot)
+            await inter.followup.send(embed=embed, view=ctrl_view)
+        else:
+            embed = styled_embed(
+                title="📥 Podcast Ditambahkan ke Antrean",
+                description=(
+                    f"**[{song.title}]({song.webpage_url})**\n"
+                    f"👤 {song.uploader} · ⏱️ `{song.duration_str}`\n\n"
+                    f"📍 Posisi: **#{len(queue.queue)}** dalam antrean"
+                ),
+                color=Theme.RADIO,
+                thumbnail=song.thumbnail,
+            )
+            await inter.followup.send(embed=embed)
+
+    # 1. Jika parameter 'cari' diisi
+    if cari:
+        query = f"{cari} podcast full"
+        episodes = await search_podcast_episodes(query, max_results=5)
+        if not episodes:
+            await interaction.followup.send(f"❌ Tidak ditemukan episode podcast untuk pencarian: `{cari}`")
+            return
+
+        embed = styled_embed(
+            title=f"🔍 Hasil Pencarian Podcast: {cari[:40]}",
+            description="Pilih episode yang ingin didengarkan dari menu dropdown di bawah:",
+            color=Theme.RADIO,
+        )
+        view = PodcastSelectView(episodes, interaction.user, on_episode_chosen)
+        await interaction.followup.send(embed=embed, view=view)
+        return
+
+    # 2. Jika parameter 'kategori' dipilih langsung
+    if kategori:
+        cat_key = kategori.value
+        cat_data = PODCAST_CATEGORIES.get(cat_key, PODCAST_CATEGORIES["trending"])
+        episodes = await search_podcast_episodes(cat_data["query"], max_results=5)
+        if not episodes:
+            await interaction.followup.send(f"❌ Gagal memuat episode trending untuk kategori `{cat_data['name']}`.")
+            return
+
+        embed = styled_embed(
+            title=f"🎙️ Podcast {cat_data['emoji']} {cat_data['name']}",
+            description=(
+                f"{cat_data['desc']}\n\n"
+                "Pilih episode podcast terbaru minggu ini dari menu dropdown di bawah:"
+            ),
+            color=Theme.RADIO,
+        )
+        view = PodcastSelectView(episodes, interaction.user, on_episode_chosen)
+        await interaction.followup.send(embed=embed, view=view)
+        return
+
+    # 3. Jika tanpa parameter, tampilkan menu kategori interaktif
+    async def on_cat_picked(inter: discord.Interaction, picked_key: str, cat_view_inst):
+        for item in cat_view_inst.children:
+            item.disabled = True
+        try:
+            await inter.response.edit_message(content="🔍 Mengambil episode podcast trending minggu ini...", view=cat_view_inst)
+        except Exception:
+            pass
+
+        cat_info = PODCAST_CATEGORIES.get(picked_key, PODCAST_CATEGORIES["trending"])
+        eps = await search_podcast_episodes(cat_info["query"], max_results=5)
+        if not eps:
+            await inter.followup.send(f"❌ Tidak ada episode ditemukan untuk kategori `{cat_info['name']}`.", ephemeral=True)
+            return
+
+        sub_embed = styled_embed(
+            title=f"🎙️ Podcast {cat_info['emoji']} {cat_info['name']}",
+            description=(
+                f"{cat_info['desc']}\n\n"
+                "Pilih episode podcast terbaru minggu ini dari menu dropdown di bawah:"
+            ),
+            color=Theme.RADIO,
+        )
+        sub_view = PodcastSelectView(eps, interaction.user, on_episode_chosen)
+        await inter.followup.send(embed=sub_embed, view=sub_view)
+
+    cat_menu_embed = styled_embed(
+        title="🎙️ Podcast Discovery & Trending Minggu Ini",
+        description=(
+            "Jelajahi talkshow santai, komedi, kisah horor, dan edukasi terpopuler.\n\n"
+            "Pilih kategori podcast yang ingin kamu dengarkan di bawah:"
+        ),
+        color=Theme.RADIO,
+    )
+    for k, v in PODCAST_CATEGORIES.items():
+        cat_menu_embed.add_field(
+            name=f"{v['emoji']} {v['name']}",
+            value=f"{v['desc']}",
+            inline=False,
+        )
+    cat_view = PodcastCategoryView(interaction.user, on_cat_picked)
+    await interaction.followup.send(embed=cat_menu_embed, view=cat_view)
 
 
 async def execute_ai_playlist(
@@ -2432,6 +2620,7 @@ async def cmd_help(interaction: discord.Interaction):
         name="🎵 Pemutar Musik & AI DJ",
         value=(
             "`/play` — Putar dari judul/URL\n"
+            "`/podcast` — 🎙️ Cari & dengar podcast trending mingguan\n"
             "`/search` — Cari & pilih dari dropdown\n"
             "`/lyrics` — Cari lirik lagu (Auto / Judul)\n"
             "`/filter` — Efek audio DSP (Bass, Nightcore, Slowed, 8D)\n"

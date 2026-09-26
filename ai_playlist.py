@@ -112,10 +112,23 @@ async def generate_ai_playlist(user_prompt: str, track_count: int = 5) -> Option
         return None
 
 
-async def recommend_next_song(recent_songs: List[Any]) -> Optional[Dict[str, str]]:
+def _clean_track_title(raw_title: str) -> str:
+    """Membersihkan judul YouTube dari tag video umum agar AI fokus ke esensi lagu."""
+    cleaned = re.sub(
+        r"[\(\[\{].*?(?:official|video|audio|lyric|lirik|clip|mv|visualizer|remaster|hd|4k|hq).*?[\)\]\}]",
+        "",
+        raw_title,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[\(\[\{].*?[\)\]\}]", "", cleaned)  # Bersihkan kurung sisa jika ada
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -|")
+    return cleaned or raw_title
+
+
+async def recommend_next_song(recent_songs: List[Any]) -> Optional[Dict[str, Any]]:
     """
-    Menganalisis 2-5 lagu terakhir yang baru saja diputar di voice room,
-    memahami tema, mood, dan genre-nya, lalu merekomendasikan 1 lagu berikutnya yang paling pas.
+    Menganalisis riwayat lagu terakhir dengan standar Music Director profesional.
+    Menghasilkan rekomendasi utama berkelas dan 2 lagu cadangan (alternatives).
     """
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or not recent_songs:
@@ -123,32 +136,55 @@ async def recommend_next_song(recent_songs: List[Any]) -> Optional[Dict[str, str
 
     recent_list_text = ""
     for i, s in enumerate(recent_songs[-5:], start=1):
-        artist = getattr(s, "uploader", "") or "Unknown"
-        title = getattr(s, "title", "") or "Unknown"
-        recent_list_text += f'{i}. "{title}" oleh {artist}\n'
+        raw_title = getattr(s, "title", "") or "Unknown"
+        clean_title = _clean_track_title(raw_title)
+        uploader = getattr(s, "uploader", "") or "Unknown"
+        recent_list_text += f'{i}. "{clean_title}" (Judul asli: {raw_title}, Channel: {uploader})\n'
 
     prompt = (
-        "Kamu adalah seorang AI DJ dan Kurator Musik berpengalaman tinggi. "
-        "Di sebuah room voice Discord, pengguna baru saja mendengarkan beberapa lagu berikut secara berturut-turut:\n\n"
+        "Kamu adalah seorang AI Music Director & DJ Kurator Kelas Dunia dengan selera musik (taste) yang sangat tinggi.\n"
+        "Di sebuah room voice Discord, pengguna baru saja mendengarkan lagu-lagu berikut:\n\n"
         f"{recent_list_text}\n"
-        "TUGAS KAMU:\n"
-        "1. Analisis genre, tema lirik, nuansa mood (apakah ceria, galau, fokus, santai, dsb), dan tempo dari lagu-lagu di atas.\n"
-        "2. Rekomendasikan TEPAT 1 lagu NYATA dan TERKENAL berikutnya yang PALING COCOK untuk menyambung alur dan suasana musik ini.\n"
-        "3. Lagu yang kamu rekomendasikan TIDAK BOLEH sama dengan lagu-lagu yang sudah ada di daftar di atas.\n"
-        "4. Berikan output HANYA berupa JSON murni dengan format:\n"
+        "PETUNJUK ANALISIS & KURASI (HARUS DIPATUHI):\n"
+        "1. IDENTIFIKASI ARTIS ASLI:\n"
+        "   Data di atas diambil dari YouTube. Nama channel/uploader sering kali adalah nama label rekaman (contoh: 'HITS Records', 'Musica Studios', 'Vevo', 'Aquarius') "
+        "   atau nama agregator. Kenali SIAPA PENYANYI SEBENARNYA dari judul video tersebut.\n\n"
+        "2. KONSISTENSI SELERA & SUB-KULTUR MUSIK (TASTE CONSISTENCY):\n"
+        "   - Pahami 'circle' atau 'sub-kultur' musik yang sedang diputar. Jangan cuma merekomendasikan lagu pop mainstream yang pasaran atau overplayed.\n"
+        "   - Contoh penyesuaian circle:\n"
+        "     * Jika user mendengarkan Indie Folk / Poetic Pop Indonesia (Tulus, Sal Priadi, Bernadya, Nadin Amizah, Kunto Aji, Pamungkas, Hindia, Feby Putri, Juicy Luicy, Coldiac) "
+        "       -> Rekomendasikan lagu dari circle yang sefrekuensi (berestetika puitis, instrumen organik/akustik, vokal intim). JANGAN lompat ke pop drama komersil yang terlalu beda estetika.\n"
+        "     * Jika user mendengarkan Pop Ballad Vokal Kuat (Mahalini, Tiara Andini, Lyodra, Keisya, Judika) -> Rekomendasikan lagu vokal ballad emosional selevel.\n"
+        "     * Jika user mendengarkan J-Pop / City Pop / Anime -> Jaga nuansa City Pop / J-Pop Jepang tetap terjaga.\n"
+        "     * Jika user mendengarkan Lofi / R&B Chill / Jazz -> Pertahankan groove santai dan instrumen hangatnya.\n"
+        "     * Jika user mendengarkan Rock / Pop-Punk / Metal -> Pertahankan energi distorsi dan ketukannya.\n\n"
+        "3. KONSISTENSI BAHASA & KULTUR (LANGUAGE CONTINUITY):\n"
+        "   - Jika lagu-lagu sebelumnya lagu Indonesia, prioritaskan 100% lagu berikutnya tetap lagu Indonesia.\n"
+        "   - Jika lagu Barat/English, rekomendasikan lagu Barat. Jangan mencampur bahasa tanpa alasan musikal yang kuat.\n\n"
+        "4. KONSISTENSI TEMPO & MOOD (ENERGY MATCHING):\n"
+        "   - Jaga agar transisi lagu tidak mengagetkan pendengar. Jangan melompat drastis dari lagu akustik syahdu lambat ke lagu party bertempo cepat.\n\n"
+        "5. PILIHAN UTAMA & 2 ALTERNATIF CADANGAN:\n"
+        "   - Berikan 1 rekomendasi terbaik (title, artist, theme, reason).\n"
+        "   - Berikan 2 alternatif lagu lain yang sama-sama cocok jika lagu utama sudah pernah diputar.\n"
+        "   - Semua lagu HARUS LAGU NYATA dan TERKENAL yang pasti ada di YouTube.\n\n"
+        "FORMAT OUTPUT (HANYA JSON MURNI TANPA MARKDOWN ATAU PENJELASAN LAIN):\n"
         "{\n"
-        '  "title": "Judul Lagu Rekomendasi",\n'
-        '  "artist": "Nama Artis/Penyanyi",\n'
-        '  "theme": "Label Genre/Tema (misal: Pop Galau Indonesia / Lofi Study / EDM Workout)",\n'
-        '  "reason": "1 kalimat ringkas kenapa lagu ini cocok melanjutkan suasana lagu sebelumnya"\n'
+        '  "title": "Judul Lagu Rekomendasi Utama",\n'
+        '  "artist": "Nama Penyanyi/Artis Asli",\n'
+        '  "theme": "Label Subgenre & Nuansa (misal: Indonesian Poetic Indie-Pop / Warm Acoustic Ballad)",\n'
+        '  "reason": "1 kalimat ringkas menjelaskan kenapa lagu ini sempurna menyambung estetika lagu sebelumnya",\n'
+        '  "alternatives": [\n'
+        '    {"title": "Judul Lagu Alternatif 1", "artist": "Artis Alternatif 1"},\n'
+        '    {"title": "Judul Lagu Alternatif 2", "artist": "Artis Alternatif 2"}\n'
+        '  ]\n'
         "}"
     )
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.6,
-            "maxOutputTokens": 400,
+            "temperature": 0.5,
+            "maxOutputTokens": 600,
             "responseMimeType": "application/json",
         },
     }
