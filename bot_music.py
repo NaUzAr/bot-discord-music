@@ -712,7 +712,7 @@ class MusicControlView(discord.ui.View):
 
 
 # ─── Music Playback Engine ───────────────────────────────────────────
-def play_next_song(guild_id: int):
+def play_next_song(guild_id: int, notify_channel: bool = True):
     """Callback pemutar lagu berikutnya dari antrean."""
     vc = bot.get_guild_voice_client(guild_id)
     queue = bot.get_queue(guild_id)
@@ -763,7 +763,7 @@ def play_next_song(guild_id: int):
                 return
             if error:
                 logger.error(f"Error saat playback: {error}")
-            play_next_song(guild_id)
+            play_next_song(guild_id, notify_channel=True)
 
         vc.play(volume_transformer, after=after_callback)
         queue.song_start_time = time.time()
@@ -780,8 +780,8 @@ def play_next_song(guild_id: int):
             update_bot_presence(song.title), bot.loop
         )
 
-        # Kirim embed Now Playing — Desain Premium
-        if queue.text_channel:
+        # Kirim embed Now Playing jika notify_channel diizinkan
+        if notify_channel and queue.text_channel:
             embed = build_now_playing_embed(
                 song=song,
                 queue=queue,
@@ -901,26 +901,6 @@ async def handle_autoplay(guild_id: int):
                         queue.add(ai_song)
                         if not vc.is_playing() and not vc.is_paused():
                             play_next_song(guild_id)
-                            if queue.text_channel:
-                                theme_text = ai_rec.get("theme", "Lagu Terkait")
-                                reason_text = ai_rec.get("reason", "Melanjutkan vibe lagu sebelumnya.")
-                                embed = discord.Embed(
-                                    title="",
-                                    description=(
-                                        f"### 🤖 AI Context AutoPlay\n"
-                                        f"{Theme.SEPARATOR_THIN}\n"
-                                        f"Menganalisis tema lagu-lagu sebelumnya...\n\n"
-                                        f"▶️ **[{ai_song.title}]({ai_song.webpage_url})**\n"
-                                        f"👤 **{ai_song.uploader}** · ⏱️ `{ai_song.duration_str}`\n\n"
-                                        f"🏷️ **Tema:** `{theme_text}`\n"
-                                        f"💡 **Alasan:** *\"{reason_text}\"*"
-                                    ),
-                                    color=Theme.AI,
-                                )
-                                if ai_song.thumbnail:
-                                    embed.set_thumbnail(url=ai_song.thumbnail)
-                                embed.set_footer(text=f"AI Smart AutoPlay  •  {Theme.BRAND_NAME}")
-                                await queue.text_channel.send(embed=embed)
                         return
             except Exception as e:
                 logger.warning(f"AI AutoPlay context error (fallback to search): {e}")
@@ -966,33 +946,6 @@ async def handle_autoplay(guild_id: int):
                 queue.add(song)
                 if not vc.is_playing() and not vc.is_paused():
                     play_next_song(guild_id)
-                    if queue.text_channel:
-                        if genre_data:
-                            genre_tag = f"{genre_data['emoji']} {genre_data['name']}"
-                            embed = styled_embed(
-                                title=f"📻 Radio: {genre_tag}",
-                                description=(
-                                    f"Memutar lagu berikutnya secara otomatis:\n\n"
-                                    f"▶️ **[{song.title}]({song.webpage_url})**\n"
-                                    f"⏱️ `{song.duration_str}`"
-                                ),
-                                color=Theme.RADIO,
-                                footer_text=f"Radio {genre_data['name']}  ·  /radio untuk ganti genre",
-                            )
-                        else:
-                            embed = styled_embed(
-                                title="📻 AutoPlay",
-                                description=(
-                                    f"Memutar rekomendasi berikutnya:\n\n"
-                                    f"▶️ **[{song.title}]({song.webpage_url})**\n"
-                                    f"⏱️ `{song.duration_str}`"
-                                ),
-                                color=Theme.PLAYING,
-                                footer_text="/radio untuk genre  ·  /autoplay on/off",
-                            )
-                        if song.thumbnail:
-                            embed.set_thumbnail(url=song.thumbnail)
-                        await queue.text_channel.send(embed=embed)
     except Exception as e:
         logger.error(f"Error pada handle_autoplay: {e}", exc_info=True)
 
@@ -1173,22 +1126,19 @@ async def cmd_play(interaction: discord.Interaction, query: str):
         queue.add(song)
 
         if not vc.is_playing() and not vc.is_paused():
-            play_next_song(guild_id)
-            embed = styled_embed(
-                title="▶️ Memutar Sekarang",
-                description=(
-                    f"**[{song.title}]({song.webpage_url})**\n"
-                    f"👤 {song.uploader} · ⏱️ `{song.duration_str}`"
-                ),
-                color=Theme.PLAYING,
-                thumbnail=song.thumbnail,
+            play_next_song(guild_id, notify_channel=False)
+            embed = build_now_playing_embed(
+                song=song,
+                queue=queue,
+                voice_client=vc,
+                connected_since=bot.connected_since.get(guild_id),
             )
-            await interaction.followup.send(embed=embed)
+            view = MusicControlView(guild_id, bot)
+            await interaction.followup.send(embed=embed, view=view)
         else:
             embed = discord.Embed(
-                title="",
+                title="📥 Ditambahkan ke Antrean",
                 description=(
-                    f"### 📥 Ditambahkan ke Antrean\n"
                     f"**[{song.title}]({song.webpage_url})**\n"
                     f"👤 {song.uploader} · ⏱️ `{song.duration_str}`\n\n"
                     f"📍 Posisi: **#{len(queue.queue)}** dalam antrean"
