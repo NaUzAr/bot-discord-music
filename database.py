@@ -158,3 +158,10 @@ async def get_user_stats(user_id: int, guild_id: int) -> Optional[Dict[str, Any]
             "today_seconds": today_sec,
             "rank": rank,
         }
+
+
+async def reset_guild_stats(guild_id: int):
+    """Mereset data voice stats untuk sebuah server."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM voice_stats WHERE guild_id = ?", (guild_id,))
+        await db.commit()

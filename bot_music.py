@@ -2234,7 +2234,7 @@ async def cmd_voicetop(interaction: discord.Interaction, limit: Optional[int] = 
         description=(
             f"### 🏆 Leaderboard Voice Channel\n"
             f"{Theme.SEPARATOR_THIN}\n"
-            f"Top **{len(rows)}** member di server **{interaction.guild.name}**:\n"
+            f"Akumulasi waktu voice member di **{interaction.guild.name}**:\n"
         ),
         color=Theme.LEADERBOARD,
     )
@@ -2249,11 +2249,31 @@ async def cmd_voicetop(interaction: discord.Interaction, limit: Optional[int] = 
         total_fmt = format_duration(total_sec)
         today_fmt = format_duration(today_sec)
 
-        lb_lines.append(f"{badge} **{name}**\n  ⏱️ Total: `{total_fmt}` · Hari ini: `{today_fmt}`")
+        # Cek apakah member sedang berada di voice channel saat ini
+        is_online_voice = member and member.voice and member.voice.channel is not None
+        status_tag = "🟢 `Di Voice`" if is_online_voice else "⚪ `Offline`"
+
+        lb_lines.append(f"{badge} **{name}** · {status_tag}\n  ⏱️ Total: `{total_fmt}` · Hari ini: `{today_fmt}`")
 
     add_safe_fields(embed, name="🏆 Peringkat", lines=lb_lines, max_chars=950, inline=False)
-    embed.set_footer(text=f"Data dihitung otomatis dari voice activity  •  {Theme.BRAND_NAME}")
+    embed.set_footer(text=f"Papan peringkat akumulasi  •  {Theme.BRAND_NAME}")
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="voicereset", description="🧹 Reset data leaderboard voice channel server ini (Admin)")
+@app_commands.default_permissions(administrator=True)
+async def cmd_voicereset(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Hanya Administrator yang dapat mereset leaderboard!", ephemeral=True)
+        return
+
+    await database.reset_guild_stats(interaction.guild.id)
+    embed = styled_embed(
+        title="🧹 Leaderboard Berhasil Direset",
+        description=f"Semua catatan waktu voice di server **{interaction.guild.name}** telah dikosongkan.",
+        color=Theme.SUCCESS,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="voicetime", description="⏱️ Cek durasi waktu kamu atau member lain di voice channel")
