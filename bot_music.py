@@ -156,50 +156,36 @@ def build_now_playing_embed(
     voice_client: Optional[discord.VoiceClient] = None,
     connected_since: Optional[datetime] = None,
 ) -> discord.Embed:
-    """Membangun embed informasi Now Playing pemutar musik."""
-    artist_display = song.uploader if song.uploader and song.uploader != "Unknown Artist" else "Unknown Artist"
+    """Membangun embed Now Playing yang bersih, sederhana, dan rapi."""
+    artist_display = song.uploader if song.uploader and song.uploader != "Unknown Artist" else None
+    artist_text = f"oleh **{artist_display}**\n" if artist_display else ""
     progress = make_progress_bar()
 
+    desc = (
+        f"**[{song.title}]({song.webpage_url})**\n"
+        f"{artist_text}\n"
+        f"{progress}\n"
+        f"`⏱️ {song.duration_str}`"
+    )
+
     embed = discord.Embed(
-        title="",
-        description=(
-            f"### 🎶 Sedang Memutar\n"
-            f"**[{song.title}]({song.webpage_url})**\n"
-            f"oleh **{artist_display}**\n\n"
-            f"{progress}\n"
-            f"`⏱️ {song.duration_str}`"
-        ),
+        title="🎶 Sedang Memutar",
+        description=desc,
         color=Theme.PLAYING,
     )
     if song.thumbnail:
         embed.set_thumbnail(url=song.thumbnail)
 
-    # Status bar kompak
-    loop_icon = "🔁" if queue.is_looping else "➡️"
-    autoplay_icon = "📻" if queue.autoplay else "⏹️"
-    vol_pct = int(queue.volume * 100)
-    status_parts = [f"🔊 `{vol_pct}%`", f"{loop_icon} Loop", f"{autoplay_icon} AutoPlay"]
-
-    genre_data = GENRE_PLAYLISTS.get(queue.autoplay_genre) if queue.autoplay_genre else None
-    if genre_data:
-        status_parts.append(f"{genre_data['emoji']} {genre_data['name']}")
-
-    if queue.audio_filter and queue.audio_filter in AUDIO_FILTERS:
-        flt_data = AUDIO_FILTERS[queue.audio_filter]
-        status_parts.append(f"{flt_data['emoji']} {flt_data['name']}")
-
-    embed.add_field(name="", value=" **·** ".join(status_parts), inline=False)
-    if song.requester:
-        embed.add_field(name="Diminta oleh", value=song.requester.mention, inline=True)
+    # Info status sederhana dalam 1 baris
+    auto_status = "ON" if queue.autoplay else "OFF"
+    info_items = [f"📻 Auto: `{auto_badge}`" if (auto_badge := auto_status) else ""]
     if queue.queue:
-        embed.add_field(name="Antrean", value=f"`{len(queue.queue)} lagu`", inline=True)
+        info_items.append(f"📜 Antrean: `{len(queue.queue)}`")
+    if song.requester:
+        info_items.append(f"Diminta oleh {song.requester.mention}")
 
-    footer_parts = [f"Volume: {vol_pct}%"]
-    if genre_data:
-        footer_parts.append(f"📻 {genre_data['name']}")
-    if queue.audio_filter and queue.audio_filter in AUDIO_FILTERS:
-        footer_parts.append(f"🎛️ {AUDIO_FILTERS[queue.audio_filter]['name']}")
-    embed.set_footer(text=f"{'  ·  '.join(footer_parts)}  •  {Theme.BRAND_NAME}")
+    embed.add_field(name="", value="  •  ".join([item for item in info_items if item]), inline=False)
+    embed.set_footer(text=Theme.BRAND_NAME)
     return embed
 
 
@@ -577,14 +563,11 @@ async def update_bot_presence(title: Optional[str] = None):
         logger.debug(f"Gagal update bot presence: {e}")
 
 
-# ─── Music Controller UI: Modern 3-Row Interactive Buttons ───────────
+# ─── Music Controller UI: Minimalist Single-Row Buttons ──────────────
 class MusicControlView(discord.ui.View):
     """
-    Tombol interaktif pemutar musik modern (3-Row Layout).
-    Persistent View: Berfungsi permanen bahkan setelah bot restart.
-    Row 0: [ ⏸️ Jeda ]  [ ⏭️ Lewati ]  [ ⏹️ Stop ]  [ 🔀 Acak ]  [ 📜 Antrean ]
-    Row 1: [ 🔁 Loop: OFF ]  [ 📻 Auto: ON ]  [ ✨ AI Next ]  [ 🎧 Radio ]  [ 📖 Lirik ]
-    Row 2: [ 🎛️ Filter Audio ]  [ 🌙 Sleep Timer ]
+    Tombol interaktif pemutar musik minimalis (1 Baris Ringkas).
+    Persistent View: [ ⏭️ Lewati ]  [ ⏹️ Stop ]  [ 📜 Antrean ]  [ 📻 Auto ]
     """
 
     def __init__(self, guild_id: Optional[int] = None, bot_instance = None):
@@ -599,128 +582,31 @@ class MusicControlView(discord.ui.View):
         gid = guild_id or self.guild_id
         if not gid or not self.bot:
             return
-        vc = self.bot.get_guild_voice_client(gid)
         queue = self.bot.get_queue(gid)
 
-        # 1. Pause / Resume Button
-        if vc and vc.is_paused():
-            self.btn_pause_resume.emoji = "▶️"
-            self.btn_pause_resume.label = "Lanjut"
-            self.btn_pause_resume.style = discord.ButtonStyle.success
-        else:
-            self.btn_pause_resume.emoji = "⏸️"
-            self.btn_pause_resume.label = "Jeda"
-            self.btn_pause_resume.style = discord.ButtonStyle.primary
-
-        # 2. Skip Button
+        # 1. Skip Button
         self.btn_skip.emoji = "⏭️"
         self.btn_skip.label = "Lewati"
         self.btn_skip.style = discord.ButtonStyle.secondary
 
-        # 3. Stop Button
+        # 2. Stop Button
         self.btn_stop.emoji = "⏹️"
         self.btn_stop.label = "Stop"
         self.btn_stop.style = discord.ButtonStyle.danger
 
-        # 4. Shuffle Button
-        self.btn_shuffle.emoji = "🔀"
-        self.btn_shuffle.label = "Acak"
-        self.btn_shuffle.style = discord.ButtonStyle.secondary
-
-        # 5. Queue Button
+        # 3. Queue Button
         q_count = len(queue.queue) if queue else 0
         self.btn_queue.emoji = "📜"
         self.btn_queue.label = f"Antrean ({q_count})" if q_count > 0 else "Antrean"
         self.btn_queue.style = discord.ButtonStyle.secondary
 
-        # 6. Loop Button
-        is_loop = queue.is_looping if queue else False
-        self.btn_loop.emoji = "🔁"
-        self.btn_loop.label = "Loop: ON" if is_loop else "Loop: OFF"
-        self.btn_loop.style = discord.ButtonStyle.success if is_loop else discord.ButtonStyle.secondary
-
-        # 7. AutoPlay Button
+        # 4. AutoPlay Button
         is_autoplay = queue.autoplay if queue else False
         self.btn_autoplay.emoji = "📻"
         self.btn_autoplay.label = "Auto: ON" if is_autoplay else "Auto: OFF"
         self.btn_autoplay.style = discord.ButtonStyle.success if is_autoplay else discord.ButtonStyle.secondary
 
-        # 8. AI Next Button
-        self.btn_ai_next.emoji = "✨"
-        self.btn_ai_next.label = "AI Next"
-        self.btn_ai_next.style = discord.ButtonStyle.primary
-
-        # 9. Radio Button
-        self.btn_radio.emoji = "🎧"
-        self.btn_radio.label = "Radio"
-        self.btn_radio.style = discord.ButtonStyle.secondary
-
-        # 10. Lyrics Button
-        self.btn_lyrics.emoji = "📖"
-        self.btn_lyrics.label = "Lirik"
-        self.btn_lyrics.style = discord.ButtonStyle.secondary
-
-        # 11. Audio Filter Button
-        flt_key = queue.audio_filter if queue else None
-        if flt_key and flt_key in AUDIO_FILTERS:
-            self.btn_filter.label = f"Filter: {AUDIO_FILTERS[flt_key]['name'][:12]}"
-            self.btn_filter.style = discord.ButtonStyle.success
-        else:
-            self.btn_filter.label = "Filter Audio"
-            self.btn_filter.style = discord.ButtonStyle.secondary
-
-        # 12. Sleep Timer Button
-        timer_session = self.bot.sleep_timer.get_session(gid) if hasattr(self.bot, 'sleep_timer') else None
-        if timer_session and timer_session.is_active:
-            self.btn_sleep.label = f"Sleep: {timer_session.remaining_str[:10]}"
-            self.btn_sleep.style = discord.ButtonStyle.success
-        else:
-            self.btn_sleep.label = "Sleep Timer"
-            self.btn_sleep.style = discord.ButtonStyle.secondary
-
-    # ─── Row 0: Playback Core Controls ───────────────────────────────
-    @discord.ui.button(label="Jeda", emoji="⏸️", style=discord.ButtonStyle.primary, row=0, custom_id="mctrl_pause_resume")
-    async def btn_pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = self.guild_id or interaction.guild_id
-        if not guild_id:
-            await interaction.response.send_message("❌ Server tidak dikenali!", ephemeral=True)
-            return
-
-        vc = self.bot.get_guild_voice_client(guild_id)
-        if not vc:
-            await interaction.response.send_message("❌ Bot tidak sedang di voice channel!", ephemeral=True)
-            return
-
-        queue = self.bot.get_queue(guild_id)
-        if vc.is_playing():
-            vc.pause()
-            if queue and not queue.pause_start_time:
-                queue.pause_start_time = time.time()
-            self._sync_states(guild_id)
-            try:
-                await interaction.response.edit_message(view=self)
-            except Exception:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message("⏸️ Musik dijeda.", ephemeral=True)
-                else:
-                    await interaction.followup.send("⏸️ Musik dijeda.", ephemeral=True)
-        elif vc.is_paused():
-            vc.resume()
-            if queue and queue.pause_start_time > 0:
-                queue.paused_duration += time.time() - queue.pause_start_time
-                queue.pause_start_time = 0.0
-            self._sync_states(guild_id)
-            try:
-                await interaction.response.edit_message(view=self)
-            except Exception:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message("▶️ Musik dilanjutkan.", ephemeral=True)
-                else:
-                    await interaction.followup.send("▶️ Musik dilanjutkan.", ephemeral=True)
-        else:
-            await interaction.response.send_message("❌ Tidak ada musik yang sedang diputar!", ephemeral=True)
-
-    @discord.ui.button(label="Lewati", emoji="⏭️", style=discord.ButtonStyle.secondary, row=0, custom_id="mctrl_skip")
+    @discord.ui.button(label="Lewati", emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="mctrl_skip")
     async def btn_skip(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = self.guild_id or interaction.guild_id
         vc = self.bot.get_guild_voice_client(guild_id)
@@ -735,7 +621,7 @@ class MusicControlView(discord.ui.View):
         if not interaction.response.is_done():
             await interaction.response.send_message("⏭️ Lagu dilewati!", ephemeral=True)
 
-    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, row=0, custom_id="mctrl_stop")
+    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, custom_id="mctrl_stop")
     async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = self.guild_id or interaction.guild_id
         vc = self.bot.get_guild_voice_client(guild_id)
@@ -761,31 +647,12 @@ class MusicControlView(discord.ui.View):
             else:
                 await interaction.followup.send("⏹️ Pemutaran dihentikan.", ephemeral=True)
 
-    @discord.ui.button(label="Acak", emoji="🔀", style=discord.ButtonStyle.secondary, row=0, custom_id="mctrl_shuffle")
-    async def btn_shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = self.guild_id or interaction.guild_id
-        queue = self.bot.get_queue(guild_id)
-        if len(queue.queue) < 2:
-            await interaction.response.send_message("ℹ️ Antrean butuh minimal 2 lagu untuk diacak.", ephemeral=True)
-            return
-
-        random.shuffle(queue.queue)
-        self._sync_states(guild_id)
-        try:
-            await interaction.response.edit_message(view=self)
-            await interaction.followup.send(f"🔀 Berhasil mengacak **{len(queue.queue)} lagu** di antrean!", ephemeral=True)
-        except Exception:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(f"🔀 Berhasil mengacak **{len(queue.queue)} lagu** di antrean!", ephemeral=True)
-            else:
-                await interaction.followup.send(f"🔀 Berhasil mengacak **{len(queue.queue)} lagu** di antrean!", ephemeral=True)
-
-    @discord.ui.button(label="Antrean", emoji="📜", style=discord.ButtonStyle.secondary, row=0, custom_id="mctrl_queue")
+    @discord.ui.button(label="Antrean", emoji="📜", style=discord.ButtonStyle.secondary, custom_id="mctrl_queue")
     async def btn_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = self.guild_id or interaction.guild_id
         queue = self.bot.get_queue(guild_id)
         embed = discord.Embed(
-            title="📜 Antrean Musik (Quick View)",
+            title="📜 Antrean Musik",
             color=Theme.INFO,
         )
         if queue.current:
@@ -804,36 +671,24 @@ class MusicControlView(discord.ui.View):
                 q_lines.append(f"*...dan {len(queue.queue) - 8} lagu lainnya.*")
             add_safe_fields(embed, name="📋 Berikutnya", lines=q_lines, max_chars=950, inline=False)
         else:
-            embed.add_field(name="📋 Berikutnya", value="*Antrean kosong — AutoPlay aktif jika dinyalakan.*", inline=False)
+            embed.add_field(name="📋 Berikutnya", value="*Antrean kosong.*", inline=False)
 
         total_songs = len(queue.queue) + (1 if queue.current else 0)
-        embed.set_footer(text=f"Total: {total_songs} lagu  •  Gunakan /queue untuk kontrol penuh  •  {Theme.BRAND_NAME}")
+        embed.set_footer(text=f"Total: {total_songs} lagu  •  {Theme.BRAND_NAME}")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ─── Row 1: Smart Modes & AI Tools ──────────────────────────────
-    @discord.ui.button(label="Loop: OFF", emoji="🔁", style=discord.ButtonStyle.secondary, row=1, custom_id="mctrl_loop")
-    async def btn_loop(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = self.guild_id or interaction.guild_id
-        queue = self.bot.get_queue(guild_id)
-        queue.is_looping = not queue.is_looping
-        self._sync_states(guild_id)
-        status_text = "diaktifkan 🔁" if queue.is_looping else "dimatikan ➡️"
-        try:
-            await interaction.response.edit_message(view=self)
-            await interaction.followup.send(f"Loop musik **{status_text}**", ephemeral=True)
-        except Exception:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(f"Loop musik **{status_text}**", ephemeral=True)
-            else:
-                await interaction.followup.send(f"Loop musik **{status_text}**", ephemeral=True)
-
-    @discord.ui.button(label="Auto: OFF", emoji="📻", style=discord.ButtonStyle.secondary, row=1, custom_id="mctrl_autoplay")
+    @discord.ui.button(label="Auto: OFF", emoji="📻", style=discord.ButtonStyle.secondary, custom_id="mctrl_autoplay")
     async def btn_autoplay(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = self.guild_id or interaction.guild_id
         queue = self.bot.get_queue(guild_id)
         queue.autoplay = not queue.autoplay
         self._sync_states(guild_id)
         status_text = "diaktifkan 📻 (Putar otomatis 24/7)" if queue.autoplay else "dimatikan ⏹️"
+
+        vc = self.bot.get_guild_voice_client(guild_id)
+        if queue.autoplay and vc and not vc.is_playing() and not queue.queue:
+            asyncio.create_task(handle_autoplay(guild_id))
+
         try:
             await interaction.response.edit_message(view=self)
             await interaction.followup.send(f"AutoPlay **{status_text}**", ephemeral=True)
@@ -842,237 +697,6 @@ class MusicControlView(discord.ui.View):
                 await interaction.response.send_message(f"AutoPlay **{status_text}**", ephemeral=True)
             else:
                 await interaction.followup.send(f"AutoPlay **{status_text}**", ephemeral=True)
-
-    @discord.ui.button(label="AI Next", emoji="✨", style=discord.ButtonStyle.primary, row=1, custom_id="mctrl_ai_next")
-    async def btn_ai_next(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        guild_id = self.guild_id or interaction.guild_id
-        vc = self.bot.get_guild_voice_client(guild_id)
-        if not vc or not vc.is_connected():
-            await interaction.followup.send("❌ Bot tidak sedang di voice channel!", ephemeral=True)
-            return
-
-        queue = self.bot.get_queue(guild_id)
-        recent_songs = list(queue.recent_history) + ([queue.current] if queue.current else [])
-        if not recent_songs:
-            await interaction.followup.send("ℹ️ Putar minimal satu lagu dulu agar AI dapat membaca referensi vibe!", ephemeral=True)
-            return
-
-        try:
-            ai_data = await recommend_next_song(recent_songs)
-            if not ai_data or not ai_data.get("title"):
-                await interaction.followup.send("⚠️ AI gagal meracik rekomendasi saat ini. Coba lagi nanti!", ephemeral=True)
-                return
-
-            search_query = f"{ai_data.get('artist', '')} {ai_data.get('title', '')}".strip()
-            song = await YTDLSource.get_song(search_query, requester=interaction.user)
-
-            if not song:
-                await interaction.followup.send(f"⚠️ AI menyarankan **{search_query}**, namun audio tidak ditemukan di YouTube.", ephemeral=True)
-                return
-
-            queue.add(song)
-            self._sync_states(guild_id)
-            try:
-                if interaction.message:
-                    await interaction.message.edit(view=self)
-            except Exception:
-                pass
-
-            theme_label = ai_data.get("theme", "Rekomendasi AI")
-            reason = ai_data.get("reason", "Melanjutkan vibe lagu sebelumnya")
-            embed = styled_embed(
-                title="✨ AI Rekomendasi Lagu Ditambahkan!",
-                description=(
-                    f"🎶 **[{song.title}]({song.webpage_url})**\n"
-                    f"👤 `{song.uploader}` · ⏱️ `{song.duration_str}`\n\n"
-                    f"🏷️ **Vibe:** `{theme_label}`\n"
-                    f"💡 *\"{reason}\"*\n\n"
-                    f"📥 Lagu dimasukkan ke antrean #{len(queue.queue)}!"
-                ),
-                color=Theme.AI,
-            )
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
-            if not vc.is_playing() and not vc.is_paused():
-                play_next_song(guild_id)
-        except Exception as e:
-            logger.error(f"Error pada btn_ai_next: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ Terjadi kesalahan saat memproses AI Next: `{e}`", ephemeral=True)
-
-    @discord.ui.button(label="Radio", emoji="🎧", style=discord.ButtonStyle.secondary, row=1, custom_id="mctrl_radio")
-    async def btn_radio(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = self.guild_id or interaction.guild_id
-        async def on_genre_selected(inter: discord.Interaction, chosen_key: str, v: GenreSelectView):
-            await inter.response.defer()
-            await apply_genre_playlist(
-                guild_id=guild_id,
-                channel=inter.channel,
-                user=inter.user,
-                genre_key=chosen_key,
-                interaction=inter,
-            )
-
-        view = GenreSelectView(interaction.user, on_genre_selected)
-        embed = styled_embed(
-            title="📻 Radio Otomatis 24/7",
-            description="Pilih genre di bawah untuk memutar musik sesuai tema non-stop:",
-            color=Theme.RADIO,
-        )
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-    @discord.ui.button(label="Lirik", emoji="📖", style=discord.ButtonStyle.secondary, row=1, custom_id="mctrl_lyrics")
-    async def btn_lyrics(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = self.guild_id or interaction.guild_id
-        queue = self.bot.get_queue(guild_id)
-        if not queue.current:
-            await interaction.response.send_message("❌ Tidak ada lagu yang sedang diputar untuk dicari liriknya!", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-        song = queue.current
-        lyrics_data = await get_lyrics(song.title, song.uploader)
-
-        if not lyrics_data or not lyrics_data.get("lyrics"):
-            await interaction.followup.send(
-                f"❌ Maaf, lirik untuk lagu **{song.title}** tidak ditemukan.",
-                ephemeral=True,
-            )
-            return
-
-        pages = chunk_lyrics(lyrics_data["lyrics"], max_chars=1800)
-        view = LyricsPaginationView(
-            pages=pages,
-            title=lyrics_data["title"],
-            artist=lyrics_data["artist"],
-            source=lyrics_data["source"],
-            requester=interaction.user,
-            thumbnail=song.thumbnail,
-        )
-        await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
-
-    # ─── Row 2: Audio DSP Filters ────────────────────────────────────
-    @discord.ui.button(label="Filter Audio", emoji="🎛️", style=discord.ButtonStyle.secondary, row=2, custom_id="mctrl_filter")
-    async def btn_filter(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = self.guild_id or interaction.guild_id
-        queue = self.bot.get_queue(guild_id)
-        current_flt = queue.audio_filter or "reset"
-        current_name = AUDIO_FILTERS[current_flt]["name"]
-        current_emoji = AUDIO_FILTERS[current_flt]["emoji"]
-
-        embed = discord.Embed(
-            title="",
-            description=(
-                f"### 🎛️ Audio DSP Filters\n"
-                f"{Theme.SEPARATOR}\n"
-                f"Ubah kualitas dan karakter suara secara langsung (real-time).\n"
-                f"Lagu akan langsung berganti efek tanpa harus mengulang dari awal!\n\n"
-                f"**Filter Aktif:** {current_emoji} **{current_name}**\n\n"
-                "Pilih efek audio dari menu dropdown di bawah:"
-            ),
-            color=Theme.PLAYING,
-        )
-
-        async def on_filter_selected(select_inter: discord.Interaction, chosen_key: str, view_instance):
-            res = apply_audio_filter(guild_id, chosen_key)
-            self._sync_states(guild_id)
-            try:
-                if interaction.message:
-                    await interaction.message.edit(view=self)
-            except Exception:
-                pass
-
-            status_desc = (
-                f"Efek berhasil diubah menjadi: {res['emoji']} **{res['name']}**\n\n"
-                f"📝 *{res['desc']}*"
-            )
-            if res["reloaded"]:
-                status_desc += f"\n\n⚡ *Lagu saat ini langsung di-reload pada detik `{format_duration(int(res['elapsed']))}`!*"
-
-            res_embed = styled_embed(
-                title=f"{res['emoji']} Audio Filter Diperbarui",
-                description=status_desc,
-                color=Theme.SUCCESS if chosen_key != "reset" else Theme.INFO,
-            )
-            await select_inter.response.edit_message(embed=res_embed, view=view_instance)
-
-        view = FilterSelectView(interaction.user, queue.audio_filter, on_filter_selected)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-    @discord.ui.button(label="Sleep Timer", emoji="🌙", style=discord.ButtonStyle.secondary, row=2, custom_id="mctrl_sleep")
-    async def btn_sleep(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = self.guild_id or interaction.guild_id
-        current_session = self.bot.sleep_timer.get_session(guild_id)
-
-        desc_lines = [
-            "### 🌙 Pengatur Waktu Tidur (Sleep Timer)",
-            Theme.SEPARATOR,
-            "Atur timer otomatis agar musik berhenti dan/atau akunmu disconnect dari voice saat tidur lelap.\n",
-        ]
-        if current_session and current_session.is_active:
-            desc_lines.append(
-                f"🟢 **Timer Sedang Aktif!**\n"
-                f"Sisa waktu: **`{current_session.remaining_str}`**\n"
-                f"Tindakan: `{current_session.action}`\n\n"
-                "Pilih waktu baru di bawah atau tekan tombol merah untuk membatalkan."
-            )
-        else:
-            desc_lines.append(
-                "Pilih durasi waktu dan tindakan yang kamu inginkan dari menu di bawah:"
-            )
-
-        embed = discord.Embed(
-            title="",
-            description="\n".join(desc_lines),
-            color=0x34495E,
-        )
-
-        async def on_set(select_inter: discord.Interaction, minutes: int, action: str, view_inst):
-            session = self.bot.sleep_timer.start_timer(
-                guild_id=guild_id,
-                minutes=minutes,
-                action=action,
-                text_channel=interaction.channel,
-                started_by=interaction.user,
-                on_trigger_callback=handle_sleep_timer_trigger,
-            )
-            self._sync_states(guild_id)
-            try:
-                if interaction.message:
-                    await interaction.message.edit(view=self)
-            except Exception:
-                pass
-
-            action_desc = "Stop musik & disconnect saya dari voice" if action == "kick_user" else ("Bot keluar voice" if action == "leave" else "Hanya stop musik")
-            res_embed = styled_embed(
-                title="🌙 Sleep Timer Berhasil Dipasang!",
-                description=(
-                    f"⏱️ **Durasi:** `{minutes} menit`\n"
-                    f"🎯 **Tindakan:** `{action_desc}`\n"
-                    f"⌛ **Selesai dalam:** `{session.remaining_str}`\n\n"
-                    f"Selamat beristirahat dan tidur nyenyak! 💤✨"
-                ),
-                color=Theme.SUCCESS,
-            )
-            await select_inter.response.edit_message(embed=res_embed, view=view_inst)
-
-        async def on_cancel(cancel_inter: discord.Interaction, view_inst):
-            self.bot.sleep_timer.cancel_timer(guild_id)
-            self._sync_states(guild_id)
-            try:
-                if interaction.message:
-                    await interaction.message.edit(view=self)
-            except Exception:
-                pass
-            res_embed = styled_embed(
-                title="🛑 Sleep Timer Dibatalkan",
-                description="Timer tidur telah dimatikan. Musik akan terus berputar secara normal.",
-                color=Theme.INFO,
-            )
-            await cancel_inter.response.edit_message(embed=res_embed, view=view_inst)
-
-        view = SleepTimerSelectView(interaction.user, current_session, on_set, on_cancel)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         """Global error handler untuk tombol agar tidak pernah hang / timed out."""
@@ -2890,10 +2514,8 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(
         name="🏛️ Tombol Interaktif",
         value=(
-            "**Now Playing (3 Baris):**\n"
-            "• `Row 0:` `⏸️ Jeda` · `⏭️ Lewati` · `⏹️ Stop` · `🔀 Acak` · `📜 Antrean`\n"
-            "• `Row 1:` `🔁 Loop` · `📻 AutoPlay` · `✨ AI Next` · `🎧 Radio` · `📖 Lirik`\n"
-            "• `Row 2:` `🎛️ Filter Audio` · `🌙 Sleep Timer`\n\n"
+            "**Now Playing:**\n"
+            "• `⏭️ Lewati` · `⏹️ Stop` · `📜 Antrean` · `📻 AutoPlay`\n\n"
             "**Pomodoro Live Timer:**\n"
             "• `⏸️ Jeda / Lanjut` · `⏭️ Lewati Fase` · `🛑 Selesai`"
         ),
