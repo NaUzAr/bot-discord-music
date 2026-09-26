@@ -29,6 +29,20 @@ Bot Discord lengkap dengan fitur musik ala Rythm, penjaga voice channel 24/7 (*K
    - **Anti-AFK & Deaf Filter**: Otomatis mengabaikan member yang sedang *deafened* (tuli) atau sendirian di room kosong untuk mencegah kecurangan farming waktu.
    - **Async SQLite (`aiosqlite`)**: Non-blocking database I/O untuk performa tinggi.
 
+5. **🤖 AI Smart Playlist & Recommendations (Google Gemini)**
+   - `/ai_playlist <prompt> [count]`: Hasilkan playlist musik tematik otomatis berdasarkan mood atau konsep.
+   - `/recommend`: Rekomendasi lagu berikutnya yang cocok dengan antrean saat ini.
+
+6. **📜 Interactive Lyrics Finder**
+   - `/lyrics [song]`: Cari lirik lagu yang sedang diputar atau judul spesifik via LRCLIB & fallback Gemini AI.
+   - Navigasi halaman lirik yang interaktif dengan tombol pagination.
+
+7. **🌙 Sleep Timer**
+   - `/sleeptimer <minutes> [action]`: Mengatur timer otomatis untuk mematikan musik atau keluar voice channel saat tertidur.
+
+8. **🎛️ Audio Filters & Presets**
+   - Berbagai preset audio seperti Bassboost, Nightcore, Vaporwave, 8D Audio, dan Lo-Fi.
+
 ---
 
 ## 🚀 Panduan Instalasi (VPS / Server)
