@@ -1,3 +1,4 @@
+import os
 import json
 import aiosqlite
 from datetime import datetime, timezone
@@ -5,7 +6,10 @@ import logging
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger("VoiceDB")
-DB_PATH = "voice_tracker.db"
+DB_PATH = os.getenv("DB_PATH", "voice_tracker.db")
+db_dir = os.path.dirname(DB_PATH)
+if db_dir:
+    os.makedirs(db_dir, exist_ok=True)
 
 
 async def init_db():

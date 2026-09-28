@@ -120,3 +120,51 @@ DISCORD_TOKEN=your_bot_token_here
   sudo systemctl daemon-reload
   sudo systemctl enable --now discord-bot
   ```
+
+---
+
+## ☁️ Panduan Deploy ke Render.com (Gratis & 24/7)
+
+Bot ini sudah dilengkapi dengan `Dockerfile`, `render.yaml`, dan web server internal dengan endpoint `/health`, sehingga dapat langsung dideploy ke **Render Web Service (Docker)**.
+
+### Langkah 1: Push Perubahan ke GitHub
+Pastikan seluruh file proyek dan `Dockerfile` sudah dipush ke repository GitHub Anda:
+```bash
+git add .
+git commit -m "Add Docker and Render deployment setup"
+git push origin main
+```
+
+### Langkah 2: Buat Web Service di Render
+1. Buka [dashboard.render.com](https://dashboard.render.com) dan login dengan akun GitHub Anda.
+2. Klik tombol **New +** di pojok kanan atas, lalu pilih **Web Service**.
+3. Pilih repository GitHub bot Anda (`bot-discord-music`), lalu klik **Connect**.
+4. Isi konfigurasi berikut:
+   - **Name**: `discord-music-bot` (atau nama unik pilihan Anda)
+   - **Region**: Pilih yang terdekat (misal: *Singapore* untuk latency terbaik ke Discord/YouTube di Indonesia)
+   - **Language / Runtime**: **Docker** *(Render akan otomatis mendeteksi Dockerfile)*
+   - **Instance Type**: **Free**
+5. Buka bagian **Advanced** dan atur:
+   - **Health Check Path**: `/health`
+6. Masukkan **Environment Variables**:
+   | Key | Value | Keterangan |
+   |---|---|---|
+   | `DISCORD_TOKEN` | `token_bot_anda` | Token dari Discord Developer Portal |
+   | `GEMINI_API_KEY` | `key_gemini_anda` | *(Opsional)* Untuk fitur AI playlist & AI DJ |
+7. Klik **Deploy Web Service**.
+
+> [!TIP]
+> **Metode Cepat via Blueprint:**
+> Anda juga bisa memilih **New +** → **Blueprint**, lalu pilih repo Anda. Render akan membaca file `render.yaml` secara otomatis!
+
+---
+
+### ⏰ Cara Agar Bot Tetap Online 24/7 (Cegah Sleep di Free Tier)
+Render Free Tier akan menidurkan (*spin down*) Web Service jika tidak ada request masuk selama 15 menit. Karena bot ini menyediakan endpoint `/health`, Anda bisa menggunakan layanan Uptime Monitor gratis:
+
+1. Daftar akun gratis di [UptimeRobot.com](https://uptimerobot.com) atau [cron-job.org](https://cron-job.org).
+2. Tambahkan monitor baru:
+   - **Monitor Type**: `HTTP(s)`
+   - **URL**: `https://<nama-aplikasi-anda>.onrender.com/health`
+   - **Monitoring Interval**: Setiap **5 menit**
+3. Simpan monitor. UptimeRobot akan otomatis mengirim ping setiap 5 menit sehingga Render tidak akan pernah tidur dan bot Discord Anda tetap siaga 24/7!
