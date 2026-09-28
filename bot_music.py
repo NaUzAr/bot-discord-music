@@ -13,7 +13,7 @@ import asyncio
 import time
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 import discord
 from discord import app_commands
@@ -37,8 +37,15 @@ from music_player import (
     format_duration,
 )
 from pomodoro import PomodoroManager
-from ai_playlist import generate_ai_playlist, recommend_next_song
-from lyrics_manager import get_lyrics, chunk_lyrics, LyricsPaginationView, clean_song_title
+from ai_playlist import generate_ai_playlist, recommend_next_song, CANDIDATE_MODELS
+from lyrics_manager import (
+    get_lyrics,
+    chunk_lyrics,
+    LyricsPaginationView,
+    clean_song_title,
+    parse_lrc,
+)
+from web_dashboard import start_web_server
 from sleep_timer import SleepTimerManager, SleepTimerSession, SleepTimerSelectView
 from podcast_manager import (
     PODCAST_CATEGORIES,
@@ -48,6 +55,7 @@ from podcast_manager import (
 )
 
 import sys
+import signal
 
 if sys.platform == "win32":
     try:
@@ -71,6 +79,13 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("RythmVoiceCompanion")
+
+# File logging — simpan log ke file untuk debugging produksi
+os.makedirs("logs", exist_ok=True)
+_file_handler = logging.FileHandler("logs/bot.log", encoding="utf-8", mode="a")
+_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+_file_handler.setLevel(logging.INFO)
+logging.getLogger().addHandler(_file_handler)
 
 # ─── 🎨 Design System: Branding & Color Palette ─────────────────────
 class Theme:
@@ -227,6 +242,7 @@ class RythmVoiceBot(discord.Client):
 
         # Sleep Timer Manager
         self.sleep_timer = SleepTimerManager()
+        self.start_time = time.time()
 
     def get_guild_voice_client(self, guild_id: int) -> Optional[discord.VoiceClient]:
         """Ambil voice client aktif untuk guild."""
@@ -239,22 +255,42 @@ class RythmVoiceBot(discord.Client):
         return self.music_queues[guild_id]
 
     async def setup_hook(self):
-        """Inisialisasi database, persistent views, dan sinkronisasi slash commands."""
+        """Inisialisasi database, persistent views, web dashboard, dan sinkronisasi slash commands."""
         await database.init_db()
         self.add_view(MusicControlView(bot_instance=self))
         await self.tree.sync()
         logger.info("✅ Slash commands & Persistent views berhasil di-sync!")
+        port = int(os.getenv("PORT", "8080"))
+        self.loop.create_task(start_web_server(self, port=port))
+
+    async def close(self):
+        """Graceful shutdown: disconnect semua voice client & cleanup bersih."""
+        logger.info("🛑 Memulai graceful shutdown bot...")
+        for gid, vc in list(self.voice_clients_dict.items()):
+            try:
+                if vc.is_connected():
+                    await vc.disconnect(force=True)
+            except Exception as e:
+                logger.warning(f"Error disconnect voice guild {gid}: {e}")
+        await super().close()
+        logger.info("👋 Bot berhasil dimatikan secara bersih (graceful shutdown).")
 
     async def on_ready(self):
         logger.info(f"✅ Bot logged in as {self.user}")
         logger.info(f"🌐 Terhubung ke {len(self.guilds)} server")
 
         # Instant guild-level sync agar commands langsung muncul detik itu juga di Discord tanpa menunggu cache 1 jam
-        for guild in self.guilds:
+        for i, guild in enumerate(self.guilds):
             try:
                 self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
                 logger.info(f"⚡ Instant guild commands synced: {len(synced)} commands untuk '{guild.name}' ({guild.id})")
+                # Rate limiting: delay antar guild sync agar tidak kena throttle Discord API
+                if i < len(self.guilds) - 1:
+                    await asyncio.sleep(1)
+            except discord.HTTPException as e:
+                logger.warning(f"⚠️ Gagal instant sync ke guild {guild.name} (HTTP {e.status}): {e}")
+                await asyncio.sleep(2)  # Tunggu lebih lama jika kena rate limit
             except Exception as e:
                 logger.warning(f"⚠️ Gagal instant sync ke guild {guild.name}: {e}")
 
@@ -1435,6 +1471,150 @@ async def cmd_loop(interaction: discord.Interaction):
     await interaction.response.send_message(f"Loop musik berhasil **{status_str}**")
 
 
+@bot.tree.command(name="shuffle", description="🔀 Acak urutan lagu dalam antrean")
+async def cmd_shuffle(interaction: discord.Interaction):
+    """Mengacak urutan lagu di antrean secara acak (Fisher-Yates shuffle)."""
+    queue = bot.get_queue(interaction.guild.id)
+
+    if not queue.queue or len(queue.queue) < 2:
+        await interaction.response.send_message(
+            "❌ Antrean terlalu sedikit untuk diacak! Minimal 2 lagu.", ephemeral=True
+        )
+        return
+
+    random.shuffle(queue.queue)
+
+    lines = []
+    for i, s in enumerate(queue.queue[:8], 1):
+        clean = s.title[:35] + ("…" if len(s.title) > 35 else "")
+        lines.append(f"`{i}.` {clean} · `{s.duration_str}`")
+    if len(queue.queue) > 8:
+        lines.append(f"*...dan {len(queue.queue) - 8} lagu lainnya.*")
+
+    embed = styled_embed(
+        title="🔀 Antrean Berhasil Diacak!",
+        description=f"**{len(queue.queue)} lagu** dalam antrean telah diacak urutannya.",
+        color=Theme.SUCCESS,
+    )
+    add_safe_fields(embed, "📋 Urutan Baru", lines, max_chars=950)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="seek", description="⏩ Loncat ke posisi waktu tertentu dalam lagu yang sedang diputar")
+@app_commands.describe(waktu="Posisi waktu tujuan (format: detik, MM:SS, atau HH:MM:SS)")
+async def cmd_seek(interaction: discord.Interaction, waktu: str):
+    """Melompat ke posisi tertentu dalam lagu menggunakan hot-reload FFmpeg."""
+    guild_id = interaction.guild.id
+    vc = bot.get_guild_voice_client(guild_id)
+    queue = bot.get_queue(guild_id)
+
+    if not vc or not (vc.is_playing() or vc.is_paused()) or not queue.current:
+        await interaction.response.send_message(
+            "❌ Tidak ada lagu yang sedang diputar!", ephemeral=True
+        )
+        return
+
+    # Parse time string: "90", "1:30", "01:30", "1:01:30"
+    parts = waktu.strip().split(":")
+    try:
+        if len(parts) == 1:
+            target_sec = int(parts[0])
+        elif len(parts) == 2:
+            target_sec = int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            target_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        else:
+            raise ValueError("Format tidak valid")
+    except ValueError:
+        await interaction.response.send_message(
+            "❌ Format waktu tidak valid! Gunakan: `detik` (misal `90`), `MM:SS` (misal `1:30`), atau `HH:MM:SS`",
+            ephemeral=True,
+        )
+        return
+
+    target_sec = max(0, target_sec)
+    if queue.current.duration and target_sec > queue.current.duration:
+        await interaction.response.send_message(
+            f"❌ Posisi `{format_duration(target_sec)}` melebihi durasi lagu (`{queue.current.duration_str}`)!",
+            ephemeral=True,
+        )
+        return
+
+    # Hot-reload audio pada posisi baru (mirip apply_audio_filter)
+    was_paused = vc.is_paused()
+    queue.is_reloading = True
+    try:
+        vc.stop()
+    except Exception:
+        pass
+
+    try:
+        ffmpeg_opts = get_ffmpeg_options(queue.audio_filter, start_time=target_sec)
+        new_source = discord.FFmpegPCMAudio(
+            queue.current.url, executable=FFMPEG_EXECUTABLE, **ffmpeg_opts
+        )
+        volume_transformer = InterruptableVolumeTransformer(
+            new_source, volume=queue.volume
+        )
+
+        def after_cb(error):
+            if queue.is_reloading:
+                return
+            if error:
+                logger.error(f"Error playback after seek: {error}")
+            play_next_song(guild_id)
+
+        vc.play(volume_transformer, after=after_cb)
+
+        # Perbarui timing tracker
+        now = time.time()
+        queue.song_start_time = now - target_sec
+        queue.paused_duration = 0.0
+        if was_paused:
+            vc.pause()
+            queue.pause_start_time = now
+        else:
+            queue.pause_start_time = 0.0
+
+        await interaction.response.send_message(
+            f"⏩ Meloncat ke posisi **`{format_duration(target_sec)}`** pada **{queue.current.title}**"
+        )
+    except Exception as e:
+        logger.error(f"Seek error: {e}", exc_info=True)
+        await interaction.response.send_message(
+            f"❌ Gagal melakukan seek: `{e}`", ephemeral=True
+        )
+    finally:
+        queue.is_reloading = False
+
+
+@bot.tree.command(name="history", description="📝 Lihat riwayat lagu yang baru saja diputar")
+async def cmd_history(interaction: discord.Interaction):
+    """Menampilkan daftar lagu terakhir yang sudah selesai diputar."""
+    queue = bot.get_queue(interaction.guild.id)
+
+    if not queue.recent_history:
+        await interaction.response.send_message(
+            "📝 Belum ada riwayat lagu. Putar beberapa lagu terlebih dahulu!", ephemeral=True
+        )
+        return
+
+    lines = []
+    for i, s in enumerate(reversed(queue.recent_history), 1):
+        clean = s.title[:38] + ("…" if len(s.title) > 38 else "")
+        uploader = (s.uploader[:18] + "…") if s.uploader and len(s.uploader) > 18 else (s.uploader or "?")
+        lines.append(f"`{i}.` [{clean}]({s.webpage_url}) · `{s.duration_str}` — {uploader}")
+
+    embed = styled_embed(
+        title="📝 Riwayat Lagu Terakhir",
+        description=f"Menampilkan **{len(queue.recent_history)}** lagu terakhir yang sudah diputar:",
+        color=Theme.INFO,
+    )
+    add_safe_fields(embed, "🎵 Riwayat", lines, max_chars=950)
+    embed.set_footer(text=f"Lagu terbaru di atas  •  {Theme.BRAND_NAME}")
+    await interaction.response.send_message(embed=embed)
+
+
 @bot.tree.command(name="filter", description="🎛️ Pasang efek audio DSP (Bassboost, Nightcore, Slowed, 8D, Lofi, dll.)")
 @app_commands.describe(jenis="Pilih efek audio filter yang ingin dipasang atau reset")
 @app_commands.choices(
@@ -1900,6 +2080,607 @@ async def cmd_aiplaylist(
 @app_commands.describe(vibe="Deskripsikan suasana/vibe lagu yang kamu inginkan")
 async def cmd_aidj(interaction: discord.Interaction, vibe: str):
     await execute_ai_playlist(interaction, prompt=vibe, jumlah=5)
+
+
+class RecommendSelectView(discord.ui.View):
+    """View berisi tombol untuk langsung memutar salah satu lagu rekomendasi AI."""
+
+    def __init__(self, guild_id: int, user: discord.User, recommendations: list):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.user = user
+        self.recommendations = recommendations
+
+        # Tombol lagu utama
+        if len(recommendations) > 0:
+            rec = recommendations[0]
+            btn_title = rec.get("title", "")[:20]
+            btn_artist = rec.get("artist", "")[:12]
+            label = f"▶️ {btn_artist} - {btn_title}".strip()
+            btn_main = discord.ui.Button(
+                label=label, style=discord.ButtonStyle.success, custom_id="rec_main"
+            )
+            btn_main.callback = self._create_callback(0)
+            self.add_item(btn_main)
+
+        # Tombol alternatif
+        for i in range(1, len(recommendations)):
+            rec = recommendations[i]
+            btn_title = rec.get("title", "")[:22]
+            label = f"🔀 Alt {i}: {btn_title}".strip()
+            btn_alt = discord.ui.Button(
+                label=label, style=discord.ButtonStyle.secondary, custom_id=f"rec_alt_{i}"
+            )
+            btn_alt.callback = self._create_callback(i)
+            self.add_item(btn_alt)
+
+    def _create_callback(self, index: int):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.user.id:
+                await interaction.response.send_message(
+                    "❌ Hanya pemanggil /recommend yang dapat memilih!", ephemeral=True
+                )
+                return
+
+            rec = self.recommendations[index]
+            query = f"{rec.get('artist', '')} {rec.get('title', '')}".strip()
+            await interaction.response.defer()
+
+            vc = await ensure_voice_connection(interaction)
+            if not vc:
+                return
+
+            queue = bot.get_queue(self.guild_id)
+            queue.text_channel = interaction.channel
+
+            try:
+                song = await YTDLSource.get_song(query, requester=interaction.user)
+                if song:
+                    queue.add(song)
+                    for child in self.children:
+                        child.disabled = True
+                    try:
+                        await interaction.message.edit(view=self)
+                    except Exception:
+                        pass
+
+                    if not vc.is_playing() and not vc.is_paused():
+                        play_next_song(self.guild_id)
+
+                    await interaction.followup.send(
+                        f"✅ **{song.title}** (`{song.duration_str}`) berhasil ditambahkan ke antrean dari rekomendasi AI!"
+                    )
+                else:
+                    await interaction.followup.send(
+                        f"❌ Tidak dapat memuat streaming audio untuk `{query}`.",
+                        ephemeral=True,
+                    )
+            except Exception as e:
+                await interaction.followup.send(
+                    f"❌ Gagal memuat lagu: `{e}`", ephemeral=True
+                )
+
+        return callback
+
+
+@bot.tree.command(name="recommend", description="🤖 Rekomendasi lagu berikutnya oleh AI Gemini berdasarkan lagu sekarang / riwayat")
+async def cmd_recommend(interaction: discord.Interaction):
+    """Minta rekomendasi lagu dari AI kurator berdasarkan riwayat lagu yang sedang didengarkan."""
+    guild_id = interaction.guild.id
+    queue = bot.get_queue(guild_id)
+
+    # Kumpulkan riwayat untuk dianalisis
+    history_to_analyze = []
+    if queue.current:
+        history_to_analyze.append(queue.current)
+    if queue.recent_history:
+        for s in reversed(queue.recent_history[-5:]):
+            if not queue.current or s.title != queue.current.title:
+                history_to_analyze.append(s)
+
+    if not history_to_analyze:
+        await interaction.response.send_message(
+            "❌ Belum ada lagu yang diputar untuk dianalisis! Putar lagu terlebih dahulu atau gunakan `/aidj`.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+
+    played_titles = [s.title for s in queue.recent_history]
+    if queue.current:
+        played_titles.append(queue.current.title)
+
+    ai_rec = await recommend_next_song(history_to_analyze, played_titles=played_titles)
+    if not ai_rec:
+        await interaction.followup.send(
+            "❌ AI kurator sedang berhalangan memberikan rekomendasi. Silakan coba lagi nanti!",
+            ephemeral=True,
+        )
+        return
+
+    rec_title = ai_rec.get("title", "Unknown")
+    rec_artist = ai_rec.get("artist", "Unknown")
+    rec_theme = ai_rec.get("theme", "Music Vibe")
+    rec_reason = ai_rec.get(
+        "reason", "Lagu ini cocok dengan alur musik yang sedang diputar."
+    )
+    alternatives = ai_rec.get("alternatives", [])
+
+    embed = styled_embed(
+        title="🤖 Rekomendasi Musik AI Kurator",
+        description=(
+            f"Berdasarkan analisis riwayat lagu:\n\n"
+            f"### 🎵 Rekomendasi Utama:\n**{rec_artist} — {rec_title}**\n\n"
+            f"🏷️ **Vibe / Subgenre:** `{rec_theme}`\n"
+            f"💡 **Alasan:** *\"{rec_reason}\"*\n"
+        ),
+        color=Theme.AI,
+    )
+
+    alt_lines = []
+    for i, alt in enumerate(alternatives, 1):
+        alt_lines.append(f"`{i}.` **{alt.get('artist')}** — {alt.get('title')}")
+    if alt_lines:
+        embed.add_field(
+            name="✨ Alternatif Cadangan", value="\n".join(alt_lines), inline=False
+        )
+
+    embed.set_footer(
+        text=f"Klik tombol di bawah untuk langsung memutar  •  Powered by Gemini  •  {Theme.BRAND_NAME}"
+    )
+
+    all_options = [{"title": rec_title, "artist": rec_artist}] + alternatives
+    view = RecommendSelectView(guild_id, interaction.user, all_options)
+    await interaction.followup.send(embed=embed, view=view)
+
+
+# ─── Slash Commands: Playlist Manager ────────────────────────────────
+playlist_group = app_commands.Group(
+    name="playlist", description="📁 Simpan, muat, dan kelola antrean playlist pribadi kamu"
+)
+
+
+async def playlist_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    playlists = await database.get_playlists(interaction.user.id, interaction.guild.id)
+    choices = []
+    for p in playlists:
+        name = p["name"]
+        if not current or current.lower() in name.lower():
+            count = p["track_count"]
+            choices.append(app_commands.Choice(name=f"{name} ({count} lagu)", value=name))
+    return choices[:25]
+
+
+@playlist_group.command(name="save", description="💾 Simpan antrean lagu saat ini menjadi playlist baru")
+@app_commands.describe(nama="Nama untuk playlist ini (misal: Santai Sore, Workout Beat)")
+async def playlist_save(interaction: discord.Interaction, nama: str):
+    queue = bot.get_queue(interaction.guild.id)
+    tracks_to_save = []
+    if queue.current:
+        tracks_to_save.append(
+            {
+                "title": queue.current.title,
+                "url": queue.current.webpage_url,
+                "duration": queue.current.duration,
+                "duration_str": queue.current.duration_str,
+                "uploader": queue.current.uploader,
+            }
+        )
+    for s in queue.queue:
+        tracks_to_save.append(
+            {
+                "title": s.title,
+                "url": s.webpage_url,
+                "duration": s.duration,
+                "duration_str": s.duration_str,
+                "uploader": s.uploader,
+            }
+        )
+
+    if not tracks_to_save:
+        await interaction.response.send_message(
+            "❌ Tidak ada lagu di antrean untuk disimpan!", ephemeral=True
+        )
+        return
+
+    clean_name = nama.strip()[:40]
+    success = await database.save_playlist(
+        interaction.user.id, interaction.guild.id, clean_name, tracks_to_save
+    )
+
+    if success:
+        embed = styled_embed(
+            title="💾 Playlist Berhasil Disimpan!",
+            description=(
+                f"Playlist **`{clean_name}`** berisi **{len(tracks_to_save)} lagu** telah disimpan ke database.\n\n"
+                f"Gunakan `/playlist load nama:{clean_name}` untuk memutar kapan saja."
+            ),
+            color=Theme.SUCCESS,
+        )
+        await interaction.response.send_message(embed=embed)
+    else:
+        await interaction.response.send_message(
+            f"❌ Gagal menyimpan playlist `{clean_name}`.", ephemeral=True
+        )
+
+
+@playlist_group.command(name="load", description="📂 Muat playlist yang sudah disimpan ke dalam antrean")
+@app_commands.describe(nama="Pilih playlist yang ingin dimuat")
+@app_commands.autocomplete(nama=playlist_autocomplete)
+async def playlist_load(interaction: discord.Interaction, nama: str):
+    await interaction.response.defer()
+    tracks = await database.load_playlist(
+        interaction.user.id, interaction.guild.id, nama.strip()
+    )
+
+    if not tracks:
+        await interaction.followup.send(
+            f"❌ Playlist **`{nama}`** tidak ditemukan atau kosong!", ephemeral=True
+        )
+        return
+
+    vc = await ensure_voice_connection(interaction)
+    if not vc:
+        return
+
+    guild_id = interaction.guild.id
+    queue = bot.get_queue(guild_id)
+    queue.text_channel = interaction.channel
+
+    loaded_count = 0
+    for t in tracks:
+        url_or_title = t.get("url") or t.get("title")
+        if not url_or_title:
+            continue
+        try:
+            song = await YTDLSource.get_song(url_or_title, requester=interaction.user)
+            if song:
+                queue.add(song)
+                loaded_count += 1
+        except Exception as e:
+            logger.warning(f"Gagal memuat lagu playlist '{url_or_title}': {e}")
+
+    if loaded_count == 0:
+        await interaction.followup.send(
+            f"❌ Gagal memuat file stream lagu dari playlist `{nama}`.", ephemeral=True
+        )
+        return
+
+    if not vc.is_playing() and not vc.is_paused():
+        play_next_song(guild_id)
+
+    embed = styled_embed(
+        title="📂 Playlist Berhasil Dimuat!",
+        description=f"Berhasil menambahkan **{loaded_count} lagu** dari playlist **`{nama}`** ke antrean!",
+        color=Theme.SUCCESS,
+    )
+    view = MusicControlView(guild_id, bot)
+    await interaction.followup.send(embed=embed, view=view)
+
+
+@playlist_group.command(name="list", description="📋 Tampilkan semua playlist yang tersimpan")
+async def playlist_list(interaction: discord.Interaction):
+    playlists = await database.get_playlists(interaction.user.id, interaction.guild.id)
+
+    if not playlists:
+        await interaction.response.send_message(
+            "📁 Kamu belum memiliki playlist yang tersimpan di server ini. Simpan dengan `/playlist save`!",
+            ephemeral=True,
+        )
+        return
+
+    lines = []
+    for i, p in enumerate(playlists, 1):
+        dt_str = p["created_at"][:10] if p["created_at"] else "-"
+        lines.append(
+            f"`{i}.` **{p['name']}** — `{p['track_count']} lagu` *(dibuat: {dt_str})*"
+        )
+
+    embed = styled_embed(
+        title=f"📁 Koleksi Playlist {interaction.user.display_name}",
+        description=f"Total: **{len(playlists)} playlist** tersimpan di server ini:\n\n"
+        + "\n".join(lines),
+        color=Theme.INFO,
+    )
+    embed.set_footer(
+        text=f"Gunakan /playlist load <nama> untuk memutar  •  {Theme.BRAND_NAME}"
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@playlist_group.command(name="delete", description="🗑️ Hapus salah satu playlist yang tersimpan")
+@app_commands.describe(nama="Pilih playlist yang ingin dihapus")
+@app_commands.autocomplete(nama=playlist_autocomplete)
+async def playlist_delete(interaction: discord.Interaction, nama: str):
+    success = await database.delete_playlist(
+        interaction.user.id, interaction.guild.id, nama.strip()
+    )
+    if success:
+        await interaction.response.send_message(
+            f"🗑️ Playlist **`{nama}`** berhasil dihapus.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"❌ Playlist **`{nama}`** tidak ditemukan atau gagal dihapus.",
+            ephemeral=True,
+        )
+
+bot.tree.add_command(playlist_group)
+
+
+# ─── Slash Commands: Lyrics & Karaoke ────────────────────────────────
+class SingAlongView(discord.ui.View):
+    """View interaktif untuk mode Karaoke / Sing-Along dengan synced lyrics."""
+
+    def __init__(
+        self,
+        guild_id: int,
+        title: str,
+        artist: str,
+        synced_lines: list,
+        full_lyrics: str,
+    ):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.title = title
+        self.artist = artist
+        self.synced_lines = synced_lines
+        self.full_lyrics = full_lyrics
+
+    def _render_current_embed(self) -> discord.Embed:
+        queue = bot.get_queue(self.guild_id)
+        elapsed = queue.get_elapsed_seconds() if queue.current else 0
+
+        # Cari baris yang sedang aktif berdasarkan elapsed seconds
+        current_idx = 0
+        for i, (ts, text) in enumerate(self.synced_lines):
+            if ts <= elapsed:
+                current_idx = i
+            else:
+                break
+
+        lines_output = []
+        start_idx = max(0, current_idx - 2)
+        end_idx = min(len(self.synced_lines), current_idx + 4)
+
+        for i in range(start_idx, end_idx):
+            ts, text = self.synced_lines[i]
+            m, s = divmod(int(ts), 60)
+            time_tag = f"`{m:02d}:{s:02d}`"
+            if i == current_idx:
+                lines_output.append(f"▶️ **{time_tag} 🎶 {text} 🎶**")
+            else:
+                lines_output.append(f"• {time_tag} *{text}*")
+
+        now_str = format_duration(int(elapsed))
+        dur_str = (
+            queue.current.duration_str
+            if (queue.current and queue.current.duration_str)
+            else "Live"
+        )
+
+        embed = styled_embed(
+            title=f"🎤 Karaoke Mode: {self.title}",
+            description=(
+                f"👤 **{self.artist}** · Posisi: `[{now_str} / {dur_str}]`\n"
+                f"{Theme.SEPARATOR_THIN}\n\n"
+                + "\n\n".join(lines_output)
+            ),
+            color=Theme.PRIMARY,
+        )
+        embed.set_footer(
+            text=f"Tekan '🔄 Refresh Lirik' untuk menyinkronkan dengan playback  •  {Theme.BRAND_NAME}"
+        )
+        return embed
+
+    @discord.ui.button(label="🔄 Refresh Lirik", style=discord.ButtonStyle.primary, emoji="🔄")
+    async def refresh_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        embed = self._render_current_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="📜 Lirik Lengkap", style=discord.ButtonStyle.secondary, emoji="📜")
+    async def full_lyrics_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        pages = chunk_lyrics(self.full_lyrics)
+        p_view = LyricsPaginationView(
+            pages, self.title, self.artist, "LRCLIB Synced", interaction.user
+        )
+        embed = styled_embed(
+            title=f"📜 Lirik Lengkap: {self.title}",
+            description=f"👤 **{self.artist}**\n\n{pages[0]}",
+            color=Theme.INFO,
+        )
+        embed.set_footer(text=f"Halaman 1/{len(pages)}  •  {Theme.BRAND_NAME}")
+        await interaction.response.send_message(embed=embed, view=p_view, ephemeral=True)
+
+
+@bot.tree.command(name="singalong", description="🎤 Mode Karaoke dengan lirik tersinkronisasi (Synced Lyrics)")
+async def cmd_singalong(interaction: discord.Interaction):
+    """Menampilkan lirik karaoke yang sinkron dengan posisi pemutaran lagu saat ini."""
+    queue = bot.get_queue(interaction.guild.id)
+    if not queue.current:
+        await interaction.response.send_message(
+            "❌ Tidak ada lagu yang sedang diputar!", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    song = queue.current
+    data = await get_lyrics(song.title, artist=song.uploader or "")
+
+    if not data or not data.get("lyrics"):
+        await interaction.followup.send(
+            f"❌ Tidak dapat menemukan lirik untuk **{song.title}**.", ephemeral=True
+        )
+        return
+
+    synced_text = data.get("synced_lyrics")
+    parsed_synced = parse_lrc(synced_text) if synced_text else []
+
+    if not parsed_synced:
+        # Fallback ke lirik paginasi normal jika belum ada data LRC
+        pages = chunk_lyrics(data["lyrics"])
+        view = LyricsPaginationView(
+            pages,
+            data["title"],
+            data["artist"],
+            data.get("source", "Gemini AI"),
+            interaction.user,
+            thumbnail=song.thumbnail,
+        )
+        embed = view.build_embed()
+        embed.set_author(
+            name="ℹ️ Lirik sinkron detik belum tersedia untuk lagu ini — menampilkan lirik lengkap:"
+        )
+        await interaction.followup.send(embed=embed, view=view)
+        return
+
+    view = SingAlongView(
+        guild_id=interaction.guild.id,
+        title=data["title"],
+        artist=data["artist"],
+        synced_lines=parsed_synced,
+        full_lyrics=data["lyrics"],
+    )
+    embed = view._render_current_embed()
+    if song.thumbnail:
+        embed.set_thumbnail(url=song.thumbnail)
+    await interaction.followup.send(embed=embed, view=view)
+
+
+@bot.tree.command(name="mood", description="🎭 Analisis suasana, emosi, dan estetika dari lagu yang sedang diputar")
+async def cmd_mood(interaction: discord.Interaction):
+    """Menganalisis vibe dan mood lagu saat ini menggunakan Google Gemini AI."""
+    queue = bot.get_queue(interaction.guild.id)
+    if not queue.current:
+        await interaction.response.send_message(
+            "❌ Tidak ada lagu yang sedang diputar!", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    song = queue.current
+
+    prompt = (
+        f"Analisis mood dan estetika lagu berikut:\n"
+        f"Judul: {song.title}\n"
+        f"Artis: {song.uploader or 'Unknown'}\n\n"
+        f"Berikan analisis dalam format JSON murni persis berikut:\n"
+        f"{{\n"
+        f'  "mood": "2-3 kata kunci emosi/mood (misal: Melankolis, Syahdu, Hangat)",\n'
+        f'  "vibe": "1 kalimat puitis/estetik menggambarkan visual atau nuansa musik ini",\n'
+        f'  "scene": "Skenario paling cocok mendengarkan lagu ini (misal: Perjalanan malam hujan, kafe sore, belajar)",\n'
+        f'  "energy": 5\n'
+        f"}}"
+    )
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        await interaction.followup.send(
+            "❌ GEMINI_API_KEY belum dikonfigurasi.", ephemeral=True
+        )
+        return
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 300,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    def _fetch_mood():
+        import urllib.request
+        data = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        }
+        for model in CANDIDATE_MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except Exception:
+                continue
+        return None
+
+    res = await asyncio.to_thread(_fetch_mood)
+    if not res:
+        await interaction.followup.send(
+            "❌ AI sedang tidak bisa diakses, silakan coba lagi.", ephemeral=True
+        )
+        return
+
+    try:
+        raw_text = res["candidates"][0]["content"]["parts"][0]["text"]
+        raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text.strip())
+        raw_text = re.sub(r"\s*```$", "", raw_text.strip())
+        data = json.loads(raw_text)
+
+        energy = data.get("energy", 5)
+        energy_bar = "🔥" * min(10, max(1, int(energy)))
+
+        embed = styled_embed(
+            title=f"🎭 Mood & Aesthetic: {song.title[:38]}",
+            description=(
+                f"👤 **{song.uploader or 'Unknown'}**\n"
+                f"{Theme.SEPARATOR_THIN}\n\n"
+                f"✨ **Vibe:** *\"{data.get('vibe')}\"*\n\n"
+                f"🎭 **Mood Utama:** `{data.get('mood')}`\n"
+                f"☕ **Cocok Untuk:** {data.get('scene')}\n"
+                f"⚡ **Energy Level:** `{energy}/10` {energy_bar}"
+            ),
+            color=Theme.AI,
+        )
+        if song.thumbnail:
+            embed.set_thumbnail(url=song.thumbnail)
+        embed.set_footer(text=f"AI Musical Aesthetic Analyzer  •  {Theme.BRAND_NAME}")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Gagal parse mood AI: {e}")
+        await interaction.followup.send(
+            "❌ Gagal menganalisis mood lagu.", ephemeral=True
+        )
+
+
+@bot.tree.command(name="dashboard", description="🌐 Link Web Dashboard & status real-time bot")
+async def cmd_dashboard(interaction: discord.Interaction):
+    """Menampilkan link dashboard web bot untuk melihat statistik & now playing."""
+    port = os.getenv("PORT", "8080")
+    web_url = os.getenv("DASHBOARD_URL", f"http://localhost:{port}")
+
+    uptime_sec = (
+        int(time.time() - bot.start_time) if hasattr(bot, "start_time") else 0
+    )
+    h = uptime_sec // 3600
+    m = (uptime_sec % 3600) // 60
+
+    embed = styled_embed(
+        title="🌐 Rythm Live Web Dashboard",
+        description=(
+            f"Pantau status bot, visualizer pemutaran lagu, dan leaderboard aktivitas secara real-time langsung dari browser kamu!\n\n"
+            f"🔗 **URL Dashboard:** [{web_url}]({web_url})\n\n"
+            f"📊 **Status Sistem:**\n"
+            f"• ⏱️ **Uptime:** `{h}h {m}m`\n"
+            f"• 📶 **Ping:** `{round(bot.latency * 1000, 1)} ms`\n"
+            f"• 🌐 **Server:** `{len(bot.guilds)}`\n"
+            f"• 🔊 **Voice Room:** `{len(bot.voice_clients_dict)}`\n"
+            f"• 🩺 **Health Check:** [{web_url}/health]({web_url}/health)"
+        ),
+        color=Theme.PRIMARY,
+    )
+    embed.set_footer(text=f"Akses melalui browser  •  {Theme.BRAND_NAME}")
+    await interaction.response.send_message(embed=embed)
 
 
 # ─── Slash Commands: Pomodoro Voice Companion ────────────────────────
@@ -2623,44 +3404,53 @@ async def cmd_help(interaction: discord.Interaction):
     )
 
     embed.add_field(
-        name="🎵 Pemutar Musik & AI DJ",
+        name="🎵 Pemutar Musik & Kontrol",
         value=(
-            "`/play` — Putar dari judul/URL\n"
-            "`/podcast` — 🎙️ Cari & dengar podcast trending mingguan\n"
-            "`/search` — Cari & pilih dari dropdown\n"
-            "`/lyrics` — Cari lirik lagu (Auto / Judul)\n"
-            "`/filter` — Efek audio DSP (Bass, Nightcore, Slowed, 8D)\n"
-            "`/aiplaylist` — AI racik playlist dari mood\n"
-            "`/aidj` — Shortcut AI DJ cepat\n"
-            "`/radio` — Auto-Playlist 24/7 per genre\n"
-            "`/genre` — Menu interaktif genre\n"
+            "`/play` — Putar dari judul/URL YouTube\n"
+            "`/search` — Cari & pilih lagu via dropdown\n"
+            "`/shuffle` — Acak urutan antrean lagu\n"
+            "`/seek` — Loncat ke menit tertentu lagu\n"
+            "`/history` — Riwayat lagu yang baru diputar\n"
+            "`/filter` — Efek audio DSP (Bass, 8D, Lofi, Slowed)\n"
             "`/skip` · `/pause` · `/resume` · `/stop`\n"
             "`/queue` · `/nowplaying` · `/volume` · `/loop`\n"
-            "`/autoplay` — AutoPlay non-stop 24/7"
+            "`/autoplay` · `/radio` · `/genre` (24/7)"
         ),
         inline=True,
     )
 
     embed.add_field(
-        name="🌐 Voice 24/7 & Utilitas",
+        name="🤖 AI & Karaoke Live",
         value=(
-            "`/join` — Bot join & standby 24/7\n"
-            "`/leave` — Keluar dari voice\n"
-            "`/voicestatus` — Atur status voice channel\n"
-            "`/status` — Cek ping & uptime\n"
+            "`/recommend` — Rekomendasi lagu AI interaktif\n"
+            "`/aiplaylist` — AI racik playlist dari mood\n"
+            "`/aidj` — Shortcut AI DJ cepat\n"
+            "`/mood` — Deteksi suasana & emosi lagu\n"
+            "`/singalong` — Karaoke dengan synced lyrics\n"
+            "`/lyrics` — Cari lirik lengkap (LRCLIB + AI)\n"
+            "`/playlist save` — Simpan playlist custom\n"
+            "`/playlist load` — Muat playlist custom\n"
+            "`/podcast` — Cari podcast trending"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🌐 Voice, Utilitas & Dashboard",
+        value=(
+            "`/dashboard` — Web Live Dashboard & Stats\n"
+            "`/join` · `/leave` — Kontrol voice bot 24/7\n"
+            "`/voicestatus` — Pasang status voice channel\n"
+            "`/status` — Cek ping, uptime & memori\n"
             "\n"
             "🌙 **Sleep Timer**\n"
-            "`/sleep` · `/sleeptimer` — Pasang timer tidur\n"
-            "`/sleep-cancel` · `/sleep-status`\n"
+            "`/sleep` · `/sleeptimer` · `/sleep-cancel`\n"
             "\n"
-            "🍅 **Pomodoro**\n"
-            "`/pomo-start` — Mulai fokus timer\n"
-            "`/pomo-stop` · `/pomo-pause` · `/pomo-resume`\n"
-            "`/pomo-status` — Cek progress\n"
+            "🍅 **Pomodoro System**\n"
+            "`/pomo-start` · `/pomo-stop` · `/pomo-status`\n"
             "\n"
-            "🏆 **Leaderboard**\n"
-            "`/voicetop` — Ranking member teraktif\n"
-            "`/voicetime` — Cek waktu voice kamu"
+            "🏆 **Voice Leaderboard**\n"
+            "`/voicetop` · `/voicetime`"
         ),
         inline=True,
     )

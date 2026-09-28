@@ -1,13 +1,39 @@
-# Ignore
-__pycache__/
-*.pyc
-venv/
+# ─── Environment & Secrets ────────────────────────────────────────────
 .env
-.env.local
+*.env.*
 !.env.example
-*.log
-*.db
 
-# Coursework / Documents
+# ─── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# ─── Database ────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ─── Logs ────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ─── IDE & OS ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── File tidak relevan ─────────────────────────────────────────────
 *.docx
 *.R

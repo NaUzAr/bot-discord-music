@@ -98,9 +98,29 @@ async def fetch_lyrics_lrclib(query: str, artist: str = "") -> Optional[Dict[str
                 "title": item.get("trackName") or query,
                 "artist": item.get("artistName") or artist or "Unknown Artist",
                 "lyrics": lyrics.strip(),
+                "synced_lyrics": synced,
                 "source": "LRCLIB",
             }
     return None
+
+
+def parse_lrc(lrc_text: str) -> List[Any]:
+    """Parse format lirik LRC ([mm:ss.xx] teks) menjadi list [(detik, teks)]."""
+    if not lrc_text:
+        return []
+    result = []
+    pattern = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\](.*)")
+    for line in lrc_text.splitlines():
+        match = pattern.match(line.strip())
+        if match:
+            minutes = int(match.group(1))
+            seconds = float(match.group(2))
+            text = match.group(3).strip()
+            total_sec = minutes * 60 + seconds
+            if text:
+                result.append((total_sec, text))
+    result.sort(key=lambda x: x[0])
+    return result
 
 
 async def fetch_lyrics_gemini(query: str, artist: str = "") -> Optional[Dict[str, Any]]:

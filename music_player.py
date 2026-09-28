@@ -439,7 +439,7 @@ class GuildMusicQueue:
         if self.current:
             self.last_played = self.current
             self.recent_history.append(self.current)
-            if len(self.recent_history) > 6:
+            if len(self.recent_history) > 20:
                 self.recent_history.pop(0)
             if self.current.webpage_url:
                 self.played_history.add(self.current.webpage_url)
@@ -447,9 +447,9 @@ class GuildMusicQueue:
                 if len(self.played_history) > 200:
                     # Hapus setengah entry terlama (set tidak ordered, tapi efek rotasinya tetap terasa)
                     evict_count = len(self.played_history) - 100
-                    it = iter(self.played_history)
-                    for _ in range(evict_count):
-                        self.played_history.discard(next(it))
+                    evict_items = list(self.played_history)[:evict_count]
+                    for item in evict_items:
+                        self.played_history.discard(item)
 
         if self.queue:
             self.current = self.queue.pop(0)

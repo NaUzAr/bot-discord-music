@@ -1,3 +1,4 @@
+import json
 import aiosqlite
 from datetime import datetime, timezone
 import logging
@@ -8,7 +9,7 @@ DB_PATH = "voice_tracker.db"
 
 
 async def init_db():
-    """Inisialisasi tabel voice stats secara async."""
+    """Inisialisasi tabel voice stats dan playlists secara async."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
@@ -19,6 +20,19 @@ async def init_db():
                 today_seconds INTEGER DEFAULT 0,
                 last_date TEXT,
                 PRIMARY KEY (user_id, guild_id)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS playlists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                tracks TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, guild_id, name)
             )
             """
         )
@@ -165,3 +179,88 @@ async def reset_guild_stats(guild_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM voice_stats WHERE guild_id = ?", (guild_id,))
         await db.commit()
+
+
+# ─── Playlist CRUD ───────────────────────────────────────────────────
+async def save_playlist(
+    user_id: int, guild_id: int, name: str, tracks: List[Dict[str, Any]]
+) -> bool:
+    """Menyimpan playlist (INSERT OR REPLACE jika nama sudah ada)."""
+    created_at = datetime.now(timezone.utc).isoformat()
+    tracks_json = json.dumps(tracks, ensure_ascii=False)
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO playlists (user_id, guild_id, name, tracks, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, guild_id, name, tracks_json, created_at),
+            )
+            await db.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Gagal menyimpan playlist '{name}': {e}")
+        return False
+
+
+async def load_playlist(
+    user_id: int, guild_id: int, name: str
+) -> Optional[List[Dict[str, Any]]]:
+    """Memuat data lagu dari playlist berdasarkan nama."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT tracks FROM playlists WHERE user_id = ? AND guild_id = ? AND name = ?",
+                (user_id, guild_id, name),
+            ) as cursor:
+                row = await cursor.fetchone()
+
+        if row:
+            return json.loads(row[0])
+        return None
+    except Exception as e:
+        logger.error(f"Gagal memuat playlist '{name}': {e}")
+        return None
+
+
+async def get_playlists(user_id: int, guild_id: int) -> List[Dict[str, Any]]:
+    """Mengambil daftar semua playlist milik user di guild tertentu."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT name, tracks, created_at FROM playlists WHERE user_id = ? AND guild_id = ? ORDER BY created_at DESC",
+                (user_id, guild_id),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        results = []
+        for name, tracks_json, created_at in rows:
+            tracks = json.loads(tracks_json)
+            results.append(
+                {
+                    "name": name,
+                    "track_count": len(tracks),
+                    "created_at": created_at,
+                }
+            )
+        return results
+    except Exception as e:
+        logger.error(f"Gagal mengambil daftar playlist: {e}")
+        return []
+
+
+async def delete_playlist(user_id: int, guild_id: int, name: str) -> bool:
+    """Menghapus playlist berdasarkan nama."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "DELETE FROM playlists WHERE user_id = ? AND guild_id = ? AND name = ?",
+                (user_id, guild_id, name),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Gagal menghapus playlist '{name}': {e}")
+        return False

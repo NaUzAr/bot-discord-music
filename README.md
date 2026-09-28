@@ -6,9 +6,12 @@ Bot Discord lengkap dengan fitur musik ala Rythm, penjaga voice channel 24/7 (*K
 
 ## ✨ Fitur Utama
 
-1. **Music Player (Full Controls)**
+1. **Music Player (Full Controls & Advanced Playback)**
    - `/play <query/url>`: Memutar musik dari YouTube (judul atau direct link).
    - `/search <query>`: Menampilkan 5 pilihan lagu teratas dalam interactive Dropdown Menu.
+   - `/shuffle`: Mengacak antrean lagu secara instan (Fisher-Yates shuffle).
+   - `/seek <waktu>`: Melompat ke detik atau menit tertentu (`01:30`) secara hot-reload.
+   - `/history`: Melihat 20 riwayat lagu terakhir yang telah diputar.
    - `/queue`, `/nowplaying`, `/skip`, `/pause`, `/resume`, `/stop`, `/loop`, `/volume`.
    - **Loop Bypass**: Fitur force skip cerdas agar perintah `/skip` tetap bekerja normal saat mode repeat/looping aktif.
 
@@ -19,29 +22,41 @@ Bot Discord lengkap dengan fitur musik ala Rythm, penjaga voice channel 24/7 (*K
    - `/status`: Informasi latency, uptime voice room, status musik, dan antrean.
 
 3. **🍅 Pomodoro Voice Companion**
-   - `/pomodoro action:start work:25 break_time:5 cycles:4`: Memulai sesi sprint belajar/kerja kelompok.
+   - `/pomo-start`: Memulai sesi sprint belajar/kerja kelompok (Fokus → Istirahat → Fokus).
    - **Anti-Drift Timer**: Timer presisi berbasis timestamp absolut (tidak mengalami deviasi waktu).
    - **Audio Ducking**: Bel notifikasi berbunyi di voice channel dengan menurunkan volume musik sejenak tanpa memutus streaming audio.
+   - `/pomo-pause`, `/pomo-resume`, `/pomo-stop`, `/pomo-status`.
 
 4. **🏆 Voice Activity Tracker & Leaderboard**
    - `/voicetop`: Papan peringkat member teraktif di voice channel.
    - `/voicetime`: Cek total waktu nongkrong dan ranking diri sendiri atau member lain.
-   - **Deaf & AFK Filter**: Otomatis mengabaikan member yang sedang *deafened* (tuli) atau berada di voice channel AFK server. Durasi voice tetap tercatat meskipun user sendirian tanpa bot harus join ke room.
+   - **Deaf & AFK Filter**: Otomatis mengabaikan member yang sedang *deafened* (tuli) atau berada di voice channel AFK server.
    - **Async SQLite (`aiosqlite`)**: Non-blocking database I/O untuk performa tinggi.
 
-5. **🤖 AI Smart Playlist & Recommendations (Google Gemini)**
-   - `/ai_playlist <prompt> [count]`: Hasilkan playlist musik tematik otomatis berdasarkan mood atau konsep.
-   - `/recommend`: Rekomendasi lagu berikutnya yang cocok dengan antrean saat ini.
+5. **🤖 AI Smart Playlist, Recommendations & Aesthetic (Google Gemini)**
+   - `/aiplaylist <prompt> [jumlah]`: Racik playlist tematik dari mood/skenario.
+   - `/aidj <vibe>`: Shortcut instan untuk DJ AI meracik 5 lagu.
+   - `/recommend`: Rekomendasi AI berdasarkan alur lagu dengan tombol instan *One-Click Play*.
+   - `/mood`: Analisis estetika, vibe, skenario pendengaran, dan energy level lagu saat ini.
 
-6. **📜 Interactive Lyrics Finder**
-   - `/lyrics [song]`: Cari lirik lagu yang sedang diputar atau judul spesifik via LRCLIB & fallback Gemini AI.
-   - Navigasi halaman lirik yang interaktif dengan tombol pagination.
+6. **📁 Custom Playlist Manager (Personal Library)**
+   - `/playlist save <nama>`: Simpan antrean lagu saat ini ke database SQLite pribadi.
+   - `/playlist load <nama>`: Muat dan putar playlist dengan autocomplete cerdas.
+   - `/playlist list`: Tampilkan semua playlist yang tersimpan beserta jumlah lagu.
+   - `/playlist delete <nama>`: Hapus playlist tersimpan.
 
-7. **🌙 Sleep Timer**
-   - `/sleeptimer <minutes> [action]`: Mengatur timer otomatis untuk mematikan musik atau keluar voice channel saat tertidur.
+7. **🎤 Synced Karaoke & Lyrics Finder**
+   - `/singalong`: Mode Karaoke interaktif dengan *Synced Lyrics* (LRC timestamps) yang bergerak mengikuti progres lagu.
+   - `/lyrics [judul]`: Cari lirik lagu lengkap via LRCLIB & fallback Google Gemini AI dengan paginasi tombol interaktif.
 
-8. **🎛️ Audio Filters & Presets**
-   - Berbagai preset audio seperti Bassboost, Nightcore, Vaporwave, 8D Audio, dan Lo-Fi.
+8. **🌐 Web Dashboard & Healthcheck Endpoint**
+   - Live Dark-Mode Glassmorphism Web UI di port `8080` (atau env `PORT`).
+   - `/health`: Endpoint JSON health check untuk Docker / Kubernetes / VPS monitoring.
+   - `/dashboard`: Dapatkan link dashboard langsung di Discord.
+
+9. **🌙 Sleep Timer & 🎛️ Audio DSP Filters**
+   - `/sleep` · `/sleeptimer`: Timer tidur otomatis (stop musik / leave voice).
+   - `/filter`: Hot-reload efek audio DSP (Bass Boost, Nightcore, Slowed + Reverb, 8D Audio, Lo-Fi).
 
 ---
 
