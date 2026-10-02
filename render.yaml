@@ -9,3 +9,5 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      - key: YOUTUBE_COOKIES_BASE64
+        sync: false

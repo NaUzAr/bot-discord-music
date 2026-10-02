@@ -37,3 +37,7 @@ desktop.ini
 # ─── File tidak relevan ─────────────────────────────────────────────
 *.docx
 *.R
+
+# YouTube Cookies
+cookies.txt
+*cookies*.txt

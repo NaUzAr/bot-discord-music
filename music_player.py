@@ -6,10 +6,12 @@ import asyncio
 from dataclasses import dataclass
 from typing import Optional, List, Any, Set
 import logging
+from dotenv import load_dotenv
 import discord
 from discord import ui
 import yt_dlp
 
+load_dotenv()
 logger = logging.getLogger("MusicPlayer")
 
 
@@ -41,6 +43,18 @@ def get_ffmpeg_executable() -> str:
 FFMPEG_EXECUTABLE = get_ffmpeg_executable()
 
 # yt-dlp configurations — Kualitas Tertinggi (Opus 48kHz)
+# Setup cookies jika tersedia (untuk mengatasi blokir bot YouTube di hosting seperti Render)
+COOKIE_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
+_cookies_b64 = os.getenv("YOUTUBE_COOKIES_BASE64")
+if _cookies_b64 and (not os.path.exists(COOKIE_FILE) or os.path.getsize(COOKIE_FILE) == 0):
+    try:
+        import base64
+        with open(COOKIE_FILE, "wb") as f:
+            f.write(base64.b64decode(_cookies_b64.strip()))
+        logger.info("[yt-dlp] Berhasil membuat cookies.txt dari YOUTUBE_COOKIES_BASE64")
+    except Exception as e:
+        logger.warning(f"[yt-dlp] Gagal decode YOUTUBE_COOKIES_BASE64: {e}")
+
 YTDL_OPTIONS = {
     "format": "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/best",
     "restrictfilenames": True,
@@ -52,7 +66,22 @@ YTDL_OPTIONS = {
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
+    "js_runtimes": {"node": {}, "deno": {}, "bun": {}},
+    "remote_components": {"ejs:github"},
 }
+
+if os.path.exists(COOKIE_FILE):
+    YTDL_OPTIONS["cookiefile"] = COOKIE_FILE
+    logger.info(f"[yt-dlp] Menggunakan file cookies: {COOKIE_FILE}")
+else:
+    # Hanya gunakan player_client android/ios jika TIDAK ada cookies
+    # karena android/ios akan di-skip yt-dlp jika diberi cookie browser
+    YTDL_OPTIONS["extractor_args"] = {
+        "youtube": {
+            "player_client": ["android", "ios"],
+            "player_skip": ["webpage", "configs"],
+        }
+    }
 
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",

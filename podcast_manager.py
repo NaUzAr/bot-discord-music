@@ -6,6 +6,7 @@ Mendukung pencarian topik bebas serta kurasi episode podcast trending minggu ini
 
 import asyncio
 import logging
+import os
 import re
 from typing import Dict, Any, List, Optional, Callable
 import discord
@@ -69,7 +70,18 @@ async def search_podcast_episodes(query: str, max_results: int = 5) -> List[Dict
         "no_warnings": True,
         "extract_flat": True,
         "skip_download": True,
+        "js_runtimes": {"node": {}, "deno": {}, "bun": {}},
+        "remote_components": {"ejs:github"},
     }
+    cookie_file = os.path.join(os.path.dirname(__file__), "cookies.txt")
+    if os.path.exists(cookie_file):
+        ydl_opts["cookiefile"] = cookie_file
+    else:
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "ios"],
+            }
+        }
 
     loop = asyncio.get_event_loop()
 

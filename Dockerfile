@@ -5,10 +5,11 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080
 
-# Install ffmpeg dan library audio Opus yang dibutuhkan Discord voice
+# Install ffmpeg, nodejs (JS challenge solver untuk yt-dlp), dan library audio Opus
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ffmpeg \
+    nodejs \
     libopus0 \
     libopus-dev && \
     rm -rf /var/lib/apt/lists/*
