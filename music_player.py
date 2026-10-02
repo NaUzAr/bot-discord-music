@@ -1,4 +1,7 @@
 import os
+import re
+import json
+import urllib.request
 import time
 import shutil
 import glob
@@ -46,16 +49,19 @@ FFMPEG_EXECUTABLE = get_ffmpeg_executable()
 # Setup cookies jika tersedia (untuk mengatasi blokir bot YouTube di hosting seperti Render)
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 _cookies_b64 = os.getenv("YOUTUBE_COOKIES_BASE64")
-if _cookies_b64 and (not os.path.exists(COOKIE_FILE) or os.path.getsize(COOKIE_FILE) == 0):
+if _cookies_b64:
     try:
         import base64
-        with open(COOKIE_FILE, "wb") as f:
-            f.write(base64.b64decode(_cookies_b64.strip()))
-        logger.info("[yt-dlp] Berhasil membuat cookies.txt dari YOUTUBE_COOKIES_BASE64")
+        _decoded = base64.b64decode(_cookies_b64.strip())
+        _current_size = os.path.getsize(COOKIE_FILE) if os.path.exists(COOKIE_FILE) else 0
+        if not os.path.exists(COOKIE_FILE) or _current_size != len(_decoded):
+            with open(COOKIE_FILE, "wb") as f:
+                f.write(_decoded)
+            logger.info("[yt-dlp] Berhasil membuat/memperbarui cookies.txt dari YOUTUBE_COOKIES_BASE64")
     except Exception as e:
         logger.warning(f"[yt-dlp] Gagal decode YOUTUBE_COOKIES_BASE64: {e}")
 
-YTDL_OPTIONS = {
+YTDL_BASE_OPTIONS = {
     "format": "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/best",
     "restrictfilenames": True,
     "noplaylist": True,
@@ -70,15 +76,32 @@ YTDL_OPTIONS = {
     "remote_components": {"ejs:github"},
 }
 
-if os.path.exists(COOKIE_FILE):
+YTDL_OPTIONS = dict(YTDL_BASE_OPTIONS)
+
+# Opsi fallback YouTube tanpa cookies menggunakan mobile/embedded client
+YTDL_OPTIONS_NOCOOKIE = {
+    **YTDL_BASE_OPTIONS,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web_embedded", "mweb"],
+            "player_skip": ["webpage", "configs"],
+        }
+    },
+}
+
+# Opsi khusus fallback SoundCloud
+YTDL_OPTIONS_SC = {
+    **YTDL_BASE_OPTIONS,
+    "default_search": "scsearch",
+}
+
+if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
     YTDL_OPTIONS["cookiefile"] = COOKIE_FILE
     logger.info(f"[yt-dlp] Menggunakan file cookies: {COOKIE_FILE}")
 else:
-    # Hanya gunakan player_client android/ios jika TIDAK ada cookies
-    # karena android/ios akan di-skip yt-dlp jika diberi cookie browser
     YTDL_OPTIONS["extractor_args"] = {
         "youtube": {
-            "player_client": ["android", "ios"],
+            "player_client": ["android", "web_embedded", "mweb"],
             "player_skip": ["webpage", "configs"],
         }
     }
@@ -269,6 +292,32 @@ GENRE_PLAYLISTS = {
 }
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+ytdl_nocookie = yt_dlp.YoutubeDL(YTDL_OPTIONS_NOCOOKIE)
+ytdl_sc = yt_dlp.YoutubeDL(YTDL_OPTIONS_SC)
+
+
+def clean_search_query(raw_title: str, author: str = "") -> str:
+    """Membersihkan judul lagu dari kata/tag sampah (Official Video, MV, dsb) agar pencarian fallback akurat."""
+    if not raw_title:
+        return ""
+    junk_patterns = [
+        r"\((?:official|music|video|audio|lyric|lyrics|hd|4k|remastered|clip|visualizer|mv|feat|ft)[^)]*\)",
+        r"\[(?:official|music|video|audio|lyric|lyrics|hd|4k|remastered|clip|visualizer|mv|feat|ft)[^\]]*\]",
+        r"\|.*$",
+        r"#\S+",
+    ]
+    cleaned = raw_title
+    for p in junk_patterns:
+        cleaned = re.sub(p, "", cleaned, flags=re.IGNORECASE)
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:|")
+
+    if author:
+        author_clean = re.sub(r" - Topic$", "", author, flags=re.IGNORECASE).strip()
+        if author_clean and author_clean.lower() not in cleaned.lower():
+            cleaned = f"{author_clean} - {cleaned}"
+
+    return cleaned or raw_title
 
 
 def format_duration(seconds: Optional[Any]) -> str:
@@ -309,12 +358,13 @@ class YTDLSource:
     """Helper untuk extract audio stream dari YouTube atau search query."""
 
     @classmethod
-    async def extract_info(cls, query: str, download: bool = False):
+    async def extract_info(cls, query: str, download: bool = False, custom_ytdl: Optional[Any] = None):
         """Extract metadata asynchronously."""
         loop = asyncio.get_event_loop()
+        instance = custom_ytdl or ytdl
         try:
             return await loop.run_in_executor(
-                None, lambda: ytdl.extract_info(query, download=download)
+                None, lambda: instance.extract_info(query, download=download)
             )
         except Exception as e:
             logger.error(f"yt-dlp extract_info error untuk query '{query}': {e}")
@@ -324,16 +374,24 @@ class YTDLSource:
     async def search_tracks(cls, query: str, max_results: int = 5) -> List[dict]:
         """Mencari beberapa hasil untuk menu /search (dengan fallback otomatis ke SoundCloud)."""
         search_query = f"ytsearch{max_results}:{query}"
-        data = await cls.extract_info(search_query, download=False)
+        data = await cls.extract_info(search_query, download=False, custom_ytdl=ytdl)
         entries = []
         if data and "entries" in data:
             entries = [entry for entry in data["entries"] if entry]
 
+        # Retry YouTube tanpa cookies jika gagal dan ada cookiefile
+        if not entries and "cookiefile" in YTDL_OPTIONS:
+            logger.info(f"[Search Retry] YouTube dengan cookies kosong, mencoba tanpa cookies: {query}")
+            data_nc = await cls.extract_info(search_query, download=False, custom_ytdl=ytdl_nocookie)
+            if data_nc and "entries" in data_nc:
+                entries = [entry for entry in data_nc["entries"] if entry]
+
         # Fallback ke SoundCloud jika YouTube diblokir atau tidak ada hasil
         if not entries:
-            logger.info(f"[Search Fallback] YouTube kosong/gagal, mencari di SoundCloud: {query}")
-            sc_query = f"scsearch{max_results}:{query}"
-            sc_data = await cls.extract_info(sc_query, download=False)
+            cleaned_query = clean_search_query(query)
+            logger.info(f"[Search Fallback] YouTube gagal, mencari di SoundCloud: {cleaned_query}")
+            sc_query = f"scsearch{max_results}:{cleaned_query}"
+            sc_data = await cls.extract_info(sc_query, download=False, custom_ytdl=ytdl_sc)
             if sc_data and "entries" in sc_data:
                 entries = [entry for entry in sc_data["entries"] if entry]
 
@@ -349,31 +407,42 @@ class YTDLSource:
     ) -> Optional[Song]:
         """Mendapatkan single song dari URL atau keyword pencarian.
 
-        Mendukung fallback otomatis ke SoundCloud jika YouTube kena blokir bot / IP VPS.
+        Mendukung retry multi-client YouTube dan fallback otomatis ke SoundCloud jika YouTube diblokir di cloud/VPS.
         """
         is_url = query.startswith("http://") or query.startswith("https://")
         search_query = query if is_url else f"ytsearch1:{query}"
 
-        # 1. Coba ambil dari YouTube / query awal terlebih dahulu
+        # 1. Coba ambil dari YouTube via primary ytdl
         data = None
         try:
-            data = await cls.extract_info(search_query, download=False)
+            data = await cls.extract_info(search_query, download=False, custom_ytdl=ytdl)
             if data and "entries" in data and data["entries"]:
                 data = data["entries"][0]
         except Exception as e:
             logger.warning(f"Ekstraksi awal gagal: {e}")
             data = None
 
-        # 2. Fallback otomatis ke SoundCloud jika YouTube gagal (misal kena blokir bot di Render/VPS)
+        # 2. Jika gagal dan cookies sedang dipakai, coba lagi tanpa cookies via mobile/embedded client
+        if (not data or not data.get("url")) and "cookiefile" in YTDL_OPTIONS:
+            try:
+                logger.info(f"[Retry YouTube] Mencoba ekstraksi tanpa cookies (mobile client): {query}")
+                data = await cls.extract_info(search_query, download=False, custom_ytdl=ytdl_nocookie)
+                if data and "entries" in data and data["entries"]:
+                    data = data["entries"][0]
+            except Exception as e:
+                logger.warning(f"Ekstraksi retry nocookie gagal: {e}")
+                data = None
+
+        # 3. Fallback otomatis ke SoundCloud jika YouTube diblokir bot / IP VPS
         if not data or not data.get("url"):
             logger.info(f"[Fallback] Mengambil alternatif audio via SoundCloud untuk: {query}")
-            sc_query = query
-            # Jika query berupa URL YouTube, ambil judulnya lewat public oEmbed API (bebas blokir)
+            sc_targets = []
+            fallback_thumbnail = None
+            fallback_uploader = None
+
+            # Jika query berupa URL YouTube, ambil judul & metadata via public oEmbed API (bebas blokir)
             if "youtube.com" in query or "youtu.be" in query:
                 try:
-                    import urllib.request
-                    import json
-
                     oembed_url = f"https://www.youtube.com/oembed?url={query}&format=json"
                     req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
                     loop = asyncio.get_event_loop()
@@ -384,22 +453,42 @@ class YTDLSource:
 
                     meta = await loop.run_in_executor(None, _fetch_oembed)
                     if meta and meta.get("title"):
-                        sc_query = f"{meta.get('title')} {meta.get('author_name', '')}"
-                        logger.info(f"[Fallback] Berhasil resolve judul oEmbed: {sc_query}")
+                        raw_title = meta.get("title", "")
+                        author = meta.get("author_name", "")
+                        fallback_thumbnail = meta.get("thumbnail_url")
+                        fallback_uploader = author
+
+                        cleaned_title = clean_search_query(raw_title, author)
+                        logger.info(f"[Fallback] oEmbed resolve: '{raw_title}' -> Cleaned: '{cleaned_title}'")
+                        if cleaned_title:
+                            sc_targets.append(cleaned_title)
+                        if raw_title and raw_title != cleaned_title:
+                            sc_targets.append(raw_title)
                 except Exception as oe_err:
                     logger.debug(f"Gagal oEmbed fallback: {oe_err}")
+            else:
+                cleaned_title = clean_search_query(query)
+                sc_targets.append(cleaned_title)
+                if query != cleaned_title:
+                    sc_targets.append(query)
 
-            sc_search = (
-                sc_query
-                if (sc_query.startswith("http://") or sc_query.startswith("https://"))
-                else f"scsearch1:{sc_query}"
-            )
-            try:
-                data = await cls.extract_info(sc_search, download=False)
-                if data and "entries" in data and data["entries"]:
-                    data = data["entries"][0]
-            except Exception as sc_err:
-                logger.error(f"[Fallback] SoundCloud extract error: {sc_err}")
+            # Coba cari di SoundCloud dengan target yang telah disanitasi
+            for target in sc_targets:
+                sc_search = (
+                    target
+                    if (target.startswith("http://") or target.startswith("https://"))
+                    else f"scsearch1:{target}"
+                )
+                try:
+                    sc_data = await cls.extract_info(sc_search, download=False, custom_ytdl=ytdl_sc)
+                    if sc_data and "entries" in sc_data and sc_data["entries"]:
+                        sc_entry = sc_data["entries"][0]
+                        if sc_entry and sc_entry.get("url"):
+                            data = sc_entry
+                            logger.info(f"[Fallback] Berhasil menemukan di SoundCloud: '{data.get('title')}'")
+                            break
+                except Exception as sc_err:
+                    logger.error(f"[Fallback] SoundCloud extract error untuk '{target}': {sc_err}")
 
         if not data or not data.get("url"):
             return None
@@ -415,10 +504,10 @@ class YTDLSource:
         return Song(
             title=data.get("title", "Unknown Title"),
             url=data.get("url"),
-            webpage_url=data.get("webpage_url", query),
+            webpage_url=query if is_url else data.get("webpage_url", query),
             duration=dur_int,
-            thumbnail=data.get("thumbnail"),
-            uploader=data.get("uploader", "Unknown Artist"),
+            thumbnail=data.get("thumbnail") or fallback_thumbnail,
+            uploader=data.get("uploader") or fallback_uploader or "Unknown Artist",
             requester=requester,
             is_podcast=is_podcast,
             ai_context=ai_context,
