@@ -316,12 +316,22 @@ class YTDLSource:
 
     @classmethod
     async def search_tracks(cls, query: str, max_results: int = 5) -> List[dict]:
-        """Mencari beberapa hasil untuk menu /search."""
+        """Mencari beberapa hasil untuk menu /search (dengan fallback otomatis ke SoundCloud)."""
         search_query = f"ytsearch{max_results}:{query}"
         data = await cls.extract_info(search_query, download=False)
-        if not data or "entries" not in data:
-            return []
-        return [entry for entry in data["entries"] if entry]
+        entries = []
+        if data and "entries" in data:
+            entries = [entry for entry in data["entries"] if entry]
+
+        # Fallback ke SoundCloud jika YouTube diblokir atau tidak ada hasil
+        if not entries:
+            logger.info(f"[Search Fallback] YouTube kosong/gagal, mencari di SoundCloud: {query}")
+            sc_query = f"scsearch{max_results}:{query}"
+            sc_data = await cls.extract_info(sc_query, download=False)
+            if sc_data and "entries" in sc_data:
+                entries = [entry for entry in sc_data["entries"] if entry]
+
+        return entries
 
     @classmethod
     async def get_song(
@@ -331,36 +341,74 @@ class YTDLSource:
         is_podcast: bool = False,
         ai_context: Optional[dict] = None,
     ) -> Optional[Song]:
-        """Mendapatkan single song dari URL atau keyword pencarian."""
+        """Mendapatkan single song dari URL atau keyword pencarian.
+
+        Mendukung fallback otomatis ke SoundCloud jika YouTube kena blokir bot / IP VPS.
+        """
         is_url = query.startswith("http://") or query.startswith("https://")
         search_query = query if is_url else f"ytsearch1:{query}"
 
+        # 1. Coba ambil dari YouTube / query awal terlebih dahulu
+        data = None
         try:
             data = await cls.extract_info(search_query, download=False)
-            if not data:
-                return None
-
-            # Jika hasil pencarian berupa list entries
-            if "entries" in data and data["entries"]:
+            if data and "entries" in data and data["entries"]:
                 data = data["entries"][0]
-
-            if not data or not data.get("url"):
-                return None
-
-            return Song(
-                title=data.get("title", "Unknown Title"),
-                url=data.get("url"),
-                webpage_url=data.get("webpage_url", query),
-                duration=data.get("duration"),
-                thumbnail=data.get("thumbnail"),
-                uploader=data.get("uploader", "Unknown Artist"),
-                requester=requester,
-                is_podcast=is_podcast,
-                ai_context=ai_context,
-            )
         except Exception as e:
-            logger.error(f"Error parsing data lagu: {e}")
+            logger.warning(f"Ekstraksi awal gagal: {e}")
+            data = None
+
+        # 2. Fallback otomatis ke SoundCloud jika YouTube gagal (misal kena blokir bot di Render/VPS)
+        if not data or not data.get("url"):
+            logger.info(f"[Fallback] Mengambil alternatif audio via SoundCloud untuk: {query}")
+            sc_query = query
+            # Jika query berupa URL YouTube, ambil judulnya lewat public oEmbed API (bebas blokir)
+            if "youtube.com" in query or "youtu.be" in query:
+                try:
+                    import urllib.request
+                    import json
+
+                    oembed_url = f"https://www.youtube.com/oembed?url={query}&format=json"
+                    req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
+                    loop = asyncio.get_event_loop()
+
+                    def _fetch_oembed():
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            return json.loads(resp.read().decode())
+
+                    meta = await loop.run_in_executor(None, _fetch_oembed)
+                    if meta and meta.get("title"):
+                        sc_query = f"{meta.get('title')} {meta.get('author_name', '')}"
+                        logger.info(f"[Fallback] Berhasil resolve judul oEmbed: {sc_query}")
+                except Exception as oe_err:
+                    logger.debug(f"Gagal oEmbed fallback: {oe_err}")
+
+            sc_search = (
+                sc_query
+                if (sc_query.startswith("http://") or sc_query.startswith("https://"))
+                else f"scsearch1:{sc_query}"
+            )
+            try:
+                data = await cls.extract_info(sc_search, download=False)
+                if data and "entries" in data and data["entries"]:
+                    data = data["entries"][0]
+            except Exception as sc_err:
+                logger.error(f"[Fallback] SoundCloud extract error: {sc_err}")
+
+        if not data or not data.get("url"):
             return None
+
+        return Song(
+            title=data.get("title", "Unknown Title"),
+            url=data.get("url"),
+            webpage_url=data.get("webpage_url", query),
+            duration=data.get("duration"),
+            thumbnail=data.get("thumbnail"),
+            uploader=data.get("uploader", "Unknown Artist"),
+            requester=requester,
+            is_podcast=is_podcast,
+            ai_context=ai_context,
+        )
 
 
 class InterruptableVolumeTransformer(discord.PCMVolumeTransformer):
