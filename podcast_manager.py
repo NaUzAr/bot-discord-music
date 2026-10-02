@@ -49,15 +49,21 @@ PODCAST_CATEGORIES: Dict[str, Dict[str, Any]] = {
 }
 
 
-def format_duration_podcast(seconds: Optional[int]) -> str:
-    """Format durasi detik ke bentuk '1j 24m' atau '48m 10s'."""
-    if not seconds or seconds <= 0:
+def format_duration_podcast(seconds: Optional[Any]) -> str:
+    """Format durasi detik ke bentuk '1j 24m' atau '48m 10s' (aman untuk float/int)."""
+    if seconds is None:
         return "Live / Unknown"
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    if h > 0:
-        return f"{h}j {m}m" if s == 0 else f"{h}j {m}m {s}s"
-    return f"{m}m {s}s"
+    try:
+        sec_int = int(float(seconds))
+        if sec_int <= 0:
+            return "Live / Unknown"
+        m, s = divmod(sec_int, 60)
+        h, m = divmod(m, 60)
+        if h > 0:
+            return f"{h}j {m}m" if s == 0 else f"{h}j {m}m {s}s"
+        return f"{m}m {s}s"
+    except (ValueError, TypeError):
+        return "Live / Unknown"
 
 
 async def search_podcast_episodes(query: str, max_results: int = 5) -> List[Dict[str, Any]]:

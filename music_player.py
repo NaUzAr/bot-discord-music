@@ -271,15 +271,21 @@ GENRE_PLAYLISTS = {
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
 
-def format_duration(seconds: Optional[int]) -> str:
-    """Format detik ke format MM:SS atau HH:MM:SS."""
-    if not seconds or seconds < 0:
+def format_duration(seconds: Optional[Any]) -> str:
+    """Format detik ke format MM:SS atau HH:MM:SS (aman untuk tipe int, float, maupun string)."""
+    if seconds is None:
         return "Live / Unknown"
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+    try:
+        sec_int = int(float(seconds))
+        if sec_int < 0:
+            return "Live / Unknown"
+        m, s = divmod(sec_int, 60)
+        h, m = divmod(m, 60)
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+    except (ValueError, TypeError):
+        return "Live / Unknown"
 
 
 @dataclass
@@ -398,11 +404,19 @@ class YTDLSource:
         if not data or not data.get("url"):
             return None
 
+        raw_dur = data.get("duration")
+        dur_int = None
+        if raw_dur is not None:
+            try:
+                dur_int = int(float(raw_dur))
+            except (ValueError, TypeError):
+                dur_int = None
+
         return Song(
             title=data.get("title", "Unknown Title"),
             url=data.get("url"),
             webpage_url=data.get("webpage_url", query),
-            duration=data.get("duration"),
+            duration=dur_int,
             thumbnail=data.get("thumbnail"),
             uploader=data.get("uploader", "Unknown Artist"),
             requester=requester,
