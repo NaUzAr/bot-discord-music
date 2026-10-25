@@ -14,6 +14,9 @@ __pycache__/
 *.sqlite3
 logs/
 *.log
+data/
+cookies.txt
+*cookies*.txt
 .vscode/
 .idea/
 *.docx

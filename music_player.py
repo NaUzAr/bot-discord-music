@@ -6,12 +6,15 @@ import time
 import shutil
 import glob
 import asyncio
+import subprocess
+import shlex
 from dataclasses import dataclass
 from typing import Optional, List, Any, Set
 import logging
 from dotenv import load_dotenv
 import discord
 from discord import ui
+from discord.opus import Encoder as OpusEncoder
 import yt_dlp
 
 load_dotenv()
@@ -48,6 +51,10 @@ FFMPEG_EXECUTABLE = get_ffmpeg_executable()
 # yt-dlp configurations — Kualitas Tertinggi (Opus 48kHz)
 # Setup cookies jika tersedia (untuk mengatasi blokir bot YouTube di hosting seperti Render)
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
+DATA_COOKIE_FILE = os.path.join(os.path.dirname(__file__), "data", "cookies.txt")
+if not os.path.exists(COOKIE_FILE) and os.path.exists(DATA_COOKIE_FILE):
+    COOKIE_FILE = DATA_COOKIE_FILE
+
 _cookies_b64 = os.getenv("YOUTUBE_COOKIES_BASE64")
 if _cookies_b64:
     try:
@@ -73,7 +80,7 @@ YTDL_BASE_OPTIONS = {
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "js_runtimes": {"node": {}, "deno": {}, "bun": {}},
-    "remote_components": {"ejs:github"},
+    "remote_components": ["ejs:github"],
 }
 
 YTDL_OPTIONS = dict(YTDL_BASE_OPTIONS)
@@ -106,8 +113,11 @@ else:
         }
     }
 
+FFMPEG_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+FFMPEG_BEFORE_OPTIONS = f'-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -headers "User-Agent: {FFMPEG_USER_AGENT}\r\n"'
+
 FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "before_options": FFMPEG_BEFORE_OPTIONS,
     "options": "-vn -af aresample=48000",
 }
 
@@ -166,7 +176,7 @@ AUDIO_FILTERS = {
 
 def get_ffmpeg_options(filter_key: Optional[str] = None, start_time: Optional[float] = None) -> dict:
     """Menghasilkan dictionary opsi FFmpeg lengkap dengan filter audio & seek position."""
-    before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+    before_options = FFMPEG_BEFORE_OPTIONS
     if start_time and start_time > 0:
         before_options += f" -ss {int(start_time)}"
 
@@ -312,9 +322,12 @@ def clean_search_query(raw_title: str, author: str = "") -> str:
 
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:|")
 
-    if author:
+    # Hanya tambahkan author jika judul BELUM ada pemisah " - " (Artis - Judul)
+    # dan author bukan nama channel / label rekaman umum
+    if author and " - " not in cleaned:
         author_clean = re.sub(r" - Topic$", "", author, flags=re.IGNORECASE).strip()
-        if author_clean and author_clean.lower() not in cleaned.lower():
+        is_label = bool(re.search(r"\b(records|record|vevo|entertainment|music|official|channel|productions|media|tv)\b", author_clean, re.IGNORECASE))
+        if not is_label and author_clean and author_clean.lower() not in cleaned.lower():
             cleaned = f"{author_clean} - {cleaned}"
 
     return cleaned or raw_title
@@ -390,10 +403,33 @@ class YTDLSource:
         if not entries:
             cleaned_query = clean_search_query(query)
             logger.info(f"[Search Fallback] YouTube gagal, mencari di SoundCloud: {cleaned_query}")
-            sc_query = f"scsearch{max_results}:{cleaned_query}"
-            sc_data = await cls.extract_info(sc_query, download=False, custom_ytdl=ytdl_sc)
-            if sc_data and "entries" in sc_data:
-                entries = [entry for entry in sc_data["entries"] if entry]
+            sc_targets = [f"scsearch{max_results * 2}:{cleaned_query}"]
+            if cleaned_query != query:
+                sc_targets.append(f"scsearch{max_results * 2}:{query}")
+
+            for sc_query in sc_targets:
+                try:
+                    sc_data = await cls.extract_info(sc_query, download=False, custom_ytdl=ytdl_sc)
+                    if sc_data and "entries" in sc_data:
+                        # Filter out klip preview 30 detik (SoundCloud preview)
+                        for entry in sc_data["entries"]:
+                            if not entry:
+                                continue
+                            dur = entry.get("duration")
+                            url = entry.get("url", "")
+                            if (dur is not None and dur <= 45) or ("/preview/" in url):
+                                continue
+                            if entry not in entries:
+                                entries.append(entry)
+                            if len(entries) >= max_results:
+                                break
+                    if len(entries) >= max_results:
+                        break
+                except Exception as sc_err:
+                    logger.error(f"[Search Fallback] Error SoundCloud query '{sc_query}': {sc_err}")
+
+            if not entries and sc_data and "entries" in sc_data:
+                entries = [entry for entry in sc_data["entries"] if entry][:max_results]
 
         return entries
 
@@ -411,6 +447,10 @@ class YTDLSource:
         """
         is_url = query.startswith("http://") or query.startswith("https://")
         search_query = query if is_url else f"ytsearch1:{query}"
+
+        fallback_title = None
+        fallback_thumbnail = None
+        fallback_uploader = None
 
         # 1. Coba ambil dari YouTube via primary ytdl
         data = None
@@ -439,6 +479,7 @@ class YTDLSource:
             sc_targets = []
             fallback_thumbnail = None
             fallback_uploader = None
+            fallback_title = None
 
             # Jika query berupa URL YouTube, ambil judul & metadata via public oEmbed API (bebas blokir)
             if "youtube.com" in query or "youtu.be" in query:
@@ -455,21 +496,41 @@ class YTDLSource:
                     if meta and meta.get("title"):
                         raw_title = meta.get("title", "")
                         author = meta.get("author_name", "")
+                        fallback_title = raw_title
                         fallback_thumbnail = meta.get("thumbnail_url")
                         fallback_uploader = author
 
-                        cleaned_title = clean_search_query(raw_title, author)
-                        logger.info(f"[Fallback] oEmbed resolve: '{raw_title}' -> Cleaned: '{cleaned_title}'")
-                        if cleaned_title:
-                            sc_targets.append(cleaned_title)
-                        if raw_title and raw_title != cleaned_title:
+                        # 1. Judul bersih murni (misal "COLORCODE - Sway")
+                        clean_base = clean_search_query(raw_title, "")
+                        if clean_base:
+                            sc_targets.append(clean_base)
+                            # Variasi tanpa tanda hubung (-) misal "COLORCODE Sway" (Sangat akurat di SoundCloud)
+                            no_dash = clean_base.replace(" - ", " ").replace("-", " ")
+                            no_dash = re.sub(r"\s+", " ", no_dash).strip()
+                            if no_dash and no_dash != clean_base and no_dash not in sc_targets:
+                                sc_targets.append(no_dash)
+
+                        # 2. Judul dengan author jika relevan
+                        cleaned_with_author = clean_search_query(raw_title, author)
+                        if cleaned_with_author and cleaned_with_author not in sc_targets:
+                            sc_targets.append(cleaned_with_author)
+
+                        # 3. Raw title asli sebagai opsi cadangan terakhir
+                        if raw_title and raw_title not in sc_targets:
                             sc_targets.append(raw_title)
+
+                        logger.info(f"[Fallback] oEmbed resolve: '{raw_title}' -> Targets: {sc_targets}")
                 except Exception as oe_err:
                     logger.debug(f"Gagal oEmbed fallback: {oe_err}")
             else:
-                cleaned_title = clean_search_query(query)
-                sc_targets.append(cleaned_title)
-                if query != cleaned_title:
+                clean_base = clean_search_query(query, "")
+                if clean_base:
+                    sc_targets.append(clean_base)
+                    no_dash = clean_base.replace(" - ", " ").replace("-", " ")
+                    no_dash = re.sub(r"\s+", " ", no_dash).strip()
+                    if no_dash and no_dash != clean_base and no_dash not in sc_targets:
+                        sc_targets.append(no_dash)
+                if query not in sc_targets:
                     sc_targets.append(query)
 
             # Coba cari di SoundCloud dengan target yang telah disanitasi
@@ -477,15 +538,27 @@ class YTDLSource:
                 sc_search = (
                     target
                     if (target.startswith("http://") or target.startswith("https://"))
-                    else f"scsearch1:{target}"
+                    else f"scsearch5:{target}"
                 )
                 try:
                     sc_data = await cls.extract_info(sc_search, download=False, custom_ytdl=ytdl_sc)
                     if sc_data and "entries" in sc_data and sc_data["entries"]:
-                        sc_entry = sc_data["entries"][0]
-                        if sc_entry and sc_entry.get("url"):
-                            data = sc_entry
-                            logger.info(f"[Fallback] Berhasil menemukan di SoundCloud: '{data.get('title')}'")
+                        valid_entries = [e for e in sc_data["entries"] if e and e.get("url")]
+                        full_entry = None
+                        for sc_entry in valid_entries:
+                            dur = sc_entry.get("duration")
+                            url = sc_entry.get("url", "")
+                            # Abaikan klip preview berdurasi <= 45 detik atau bertanda /preview/
+                            if (dur is not None and dur <= 45) or ("/preview/" in url):
+                                continue
+                            full_entry = sc_entry
+                            break
+
+                        # Jika ada versi full, pilih versi full. Jika semua preview, fallback ke entri valid pertama
+                        data = full_entry or (valid_entries[0] if valid_entries else None)
+                        if data and data.get("url"):
+                            chosen_dur = data.get("duration")
+                            logger.info(f"[Fallback] Berhasil menemukan di SoundCloud ({int(chosen_dur) if chosen_dur else '?'}s): '{data.get('title')}'")
                             break
                 except Exception as sc_err:
                     logger.error(f"[Fallback] SoundCloud extract error untuk '{target}': {sc_err}")
@@ -501,13 +574,18 @@ class YTDLSource:
             except (ValueError, TypeError):
                 dur_int = None
 
+        # Prioritaskan judul, thumbnail, dan uploader asli dari YouTube jika query adalah link YouTube
+        final_title = (fallback_title if (is_url and fallback_title) else None) or data.get("title", "Unknown Title")
+        final_thumbnail = (fallback_thumbnail if (is_url and fallback_thumbnail) else None) or data.get("thumbnail")
+        final_uploader = (fallback_uploader if (is_url and fallback_uploader) else None) or data.get("uploader") or "Unknown Artist"
+
         return Song(
-            title=data.get("title", "Unknown Title"),
+            title=final_title,
             url=data.get("url"),
             webpage_url=query if is_url else data.get("webpage_url", query),
             duration=dur_int,
-            thumbnail=data.get("thumbnail") or fallback_thumbnail,
-            uploader=data.get("uploader") or fallback_uploader or "Unknown Artist",
+            thumbnail=final_thumbnail,
+            uploader=final_uploader,
             requester=requester,
             is_podcast=is_podcast,
             ai_context=ai_context,
@@ -573,6 +651,149 @@ class InterruptableVolumeTransformer(discord.PCMVolumeTransformer):
         super().cleanup()
 
 
+class PipedFFmpegAudio(discord.AudioSource):
+    """
+    AudioSource yang mem-pipe bitstream audio langsung dari subprocess yt-dlp ke FFmpeg stdin (pipe:0).
+    Ini sepenuhnya menghilangkan error 403 Forbidden dari YouTube googlevideo CDN
+    karena yt-dlp menangani semua cookie, session tokens, PO tokens, dan challenge secara lokal.
+    """
+
+    def __init__(
+        self,
+        source: str,
+        *,
+        cookie_file: Optional[str] = None,
+        ffmpeg_executable: str = "ffmpeg",
+        before_options: Optional[str] = None,
+        options: Optional[str] = None,
+    ):
+        self.source = source
+        self.ffmpeg_proc: Optional[subprocess.Popen] = None
+        self.ytdlp_proc: Optional[subprocess.Popen] = None
+
+        ytdlp_cmd = [
+            "yt-dlp",
+            "-f", "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/best",
+            "--no-warnings",
+            "--quiet",
+            "--no-playlist",
+            "-o", "-",
+        ]
+        if cookie_file and os.path.exists(cookie_file) and os.path.getsize(cookie_file) > 0:
+            ytdlp_cmd.extend(["--cookies", cookie_file])
+
+        ytdlp_cmd.append(source)
+
+        # 1. Jalankan proses yt-dlp
+        self.ytdlp_proc = subprocess.Popen(
+            ytdlp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # 2. Susun parameter FFmpeg
+        args = [ffmpeg_executable]
+        if before_options:
+            args.extend(shlex.split(before_options))
+        args.extend(["-i", "pipe:0"])
+        args.extend([
+            "-f", "s16le",
+            "-ar", "48000",
+            "-ac", "2",
+            "-loglevel", "warning",
+        ])
+        if options:
+            args.extend(shlex.split(options))
+        args.append("pipe:1")
+
+        # 3. Jalankan FFmpeg dengan input dari stdout yt-dlp
+        self.ffmpeg_proc = subprocess.Popen(
+            args,
+            stdin=self.ytdlp_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # Tutup file handle stdout yt-dlp di parent agar child FFmpeg menjadi satu-satunya pemilik read pipe
+        if self.ytdlp_proc.stdout:
+            self.ytdlp_proc.stdout.close()
+
+    def read(self) -> bytes:
+        if not self.ffmpeg_proc or not self.ffmpeg_proc.stdout:
+            return b""
+        try:
+            ret = self.ffmpeg_proc.stdout.read(OpusEncoder.FRAME_SIZE)
+            if len(ret) != OpusEncoder.FRAME_SIZE:
+                return b""
+            return ret
+        except Exception:
+            return b""
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self) -> None:
+        if self.ffmpeg_proc:
+            try:
+                self.ffmpeg_proc.kill()
+            except Exception:
+                pass
+            self.ffmpeg_proc = None
+        if self.ytdlp_proc:
+            try:
+                self.ytdlp_proc.kill()
+            except Exception:
+                pass
+            self.ytdlp_proc = None
+
+    def __del__(self):
+        self.cleanup()
+
+
+def is_youtube_source(song: Song) -> bool:
+    """Mengecek apakah audio berasal dari YouTube yang membutuhkan piping yt-dlp."""
+    target = f"{song.webpage_url or ''} {song.url or ''}".lower()
+    return any(k in target for k in ["youtube.com", "youtu.be", "googlevideo.com"])
+
+
+def create_audio_source(
+    song: Song,
+    filter_key: Optional[str] = None,
+    start_time: Optional[float] = None,
+) -> discord.AudioSource:
+    """Membuat AudioSource yang aman dan optimal (piped yt-dlp untuk YouTube, direct untuk SoundCloud)."""
+    ffmpeg_opts = get_ffmpeg_options(filter_key, start_time=start_time)
+
+    if is_youtube_source(song):
+        target_url = (
+            song.webpage_url
+            if (
+                song.webpage_url
+                and ("youtube.com" in song.webpage_url or "youtu.be" in song.webpage_url)
+            )
+            else (song.url or song.webpage_url)
+        )
+        before_opts = f"-ss {int(start_time)}" if (start_time and start_time > 0) else ""
+        cookie_to_use = (
+            COOKIE_FILE
+            if (os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0)
+            else None
+        )
+        return PipedFFmpegAudio(
+            target_url,
+            cookie_file=cookie_to_use,
+            ffmpeg_executable=FFMPEG_EXECUTABLE,
+            before_options=before_opts,
+            options=ffmpeg_opts.get("options", ""),
+        )
+    else:
+        return discord.FFmpegPCMAudio(
+            song.url,
+            executable=FFMPEG_EXECUTABLE,
+            **ffmpeg_opts,
+        )
+
+
 class GuildMusicQueue:
     """Menangani antrean musik per Discord Server."""
 
@@ -585,6 +806,7 @@ class GuildMusicQueue:
         self.autoplay: bool = True  # Mode AutoPlay 24/7 (default: aktif)
         self.autoplay_genre: Optional[str] = None  # Key dari GENRE_PLAYLISTS jika radio genre aktif
         self.manual_stopped: bool = False
+        self.is_loading_playlist: bool = False
         self.last_played: Optional[Song] = None
         self.recent_history: List[Song] = []  # Menyimpan hingga 6 lagu terakhir untuk analisis tema AI AutoPlay
         self.played_history: Set[str] = set()
@@ -645,10 +867,11 @@ class GuildMusicQueue:
         self.pause_start_time = 0.0
         self.paused_duration = 0.0
         self.is_reloading = False
+        self.is_loading_playlist = False
 
 
 class SearchSelectView(ui.View):
-    """Dropdown View untuk memilih hasil /search."""
+    """View interaktif (Tombol Angka 1-5 & Dropdown Menu) untuk memilih hasil /search."""
 
     def __init__(
         self,
@@ -660,7 +883,22 @@ class SearchSelectView(ui.View):
         self.tracks = tracks
         self.requester = requester
         self.on_select_callback = on_select_callback
+        self.message: Optional[discord.Message] = None
 
+        number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+
+        # 1. Baris Tombol Angka (Row 0)
+        for i in range(min(5, len(tracks))):
+            btn = ui.Button(
+                emoji=number_emojis[i],
+                style=discord.ButtonStyle.primary,
+                row=0,
+                custom_id=f"search_btn_{i}",
+            )
+            btn.callback = self._create_button_callback(i)
+            self.add_item(btn)
+
+        # 2. Menu Dropdown Pilihan Lagu (Row 1)
         options = []
         for i, track in enumerate(tracks[:5]):
             title = track.get("title", f"Track {i+1}")[:95]
@@ -673,19 +911,113 @@ class SearchSelectView(ui.View):
                     label=f"{i+1}. {title}",
                     description=desc,
                     value=str(i),
+                    emoji=number_emojis[i],
                 )
             )
 
         self.select_menu = ui.Select(
-            placeholder="🎵 Pilih lagu yang ingin kamu putar...",
+            placeholder="🎵 Atau pilih dari daftar dropdown...",
             options=options,
+            row=1,
         )
         self.select_menu.callback = self.select_callback
         self.add_item(self.select_menu)
 
-        self.btn_cancel = ui.Button(label="Batal", emoji="❌", style=discord.ButtonStyle.secondary, row=1)
+        # 3. Tombol Batal (Row 2)
+        self.btn_cancel = ui.Button(
+            label="Batal",
+            emoji="❌",
+            style=discord.ButtonStyle.secondary,
+            row=2,
+            custom_id="search_btn_cancel",
+        )
         self.btn_cancel.callback = self.cancel_callback
         self.add_item(self.btn_cancel)
+
+    def _create_button_callback(self, index: int):
+        async def button_callback(interaction: discord.Interaction):
+            await self.select_track_by_index(interaction, index)
+        return button_callback
+
+    async def select_callback(self, interaction: discord.Interaction):
+        selected_idx = int(self.select_menu.values[0])
+        await self.select_track_by_index(interaction, selected_idx)
+
+    async def select_track_by_index(self, interaction: discord.Interaction, selected_idx: int):
+        if interaction.user.id != self.requester.id:
+            await interaction.response.send_message(
+                "❌ Hanya yang menjalankan perintah yang bisa memilih lagu!",
+                ephemeral=True,
+            )
+            return
+
+        user = interaction.user
+        if not user.voice or not user.voice.channel:
+            await interaction.response.send_message(
+                "❌ Kamu harus berada di voice channel untuk memilih lagu!",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        if guild and guild.voice_client and guild.voice_client.channel:
+            if user.voice.channel.id != guild.voice_client.channel.id:
+                await interaction.response.send_message(
+                    f"❌ Kamu harus berada di voice channel yang sama dengan bot (**🔊 {guild.voice_client.channel.name}**) untuk memilih lagu!",
+                    ephemeral=True,
+                )
+                return
+
+        if selected_idx < 0 or selected_idx >= len(self.tracks):
+            return
+
+        # Defer agar interaksi tidak timeout jika proses ekstraksi stream memakan waktu
+        await interaction.response.defer()
+
+        # Matikan view setelah memilih
+        self.stop()
+        for item in self.children:
+            item.disabled = True
+
+        chosen_track = self.tracks[selected_idx]
+        raw_stream_url = chosen_track.get("url")
+        webpage_url = chosen_track.get("webpage_url") or raw_stream_url or ""
+
+        # Cek apakah URL sudah berupa direct stream yang playable
+        is_direct_audio = (
+            raw_stream_url
+            and (raw_stream_url.startswith("http://") or raw_stream_url.startswith("https://"))
+            and ("youtube.com" not in raw_stream_url and "youtu.be" not in raw_stream_url)
+            and (".googlevideo.com" not in raw_stream_url)
+        )
+
+        if not is_direct_audio:
+            target_q = webpage_url or chosen_track.get("title", "")
+            resolved = await YTDLSource.get_song(target_q, requester=self.requester)
+            if resolved:
+                song = resolved
+            else:
+                song = Song(
+                    title=chosen_track.get("title", "Unknown Title"),
+                    url=raw_stream_url or webpage_url,
+                    webpage_url=webpage_url,
+                    duration=chosen_track.get("duration"),
+                    thumbnail=chosen_track.get("thumbnail"),
+                    uploader=chosen_track.get("uploader", "Unknown Artist"),
+                    requester=self.requester,
+                )
+        else:
+            song = Song(
+                title=chosen_track.get("title", "Unknown Title"),
+                url=raw_stream_url,
+                webpage_url=webpage_url,
+                duration=chosen_track.get("duration"),
+                thumbnail=chosen_track.get("thumbnail"),
+                uploader=chosen_track.get("uploader", "Unknown Artist"),
+                requester=self.requester,
+            )
+
+        await self.on_select_callback(interaction, song, self)
 
     async def cancel_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.requester.id:
@@ -699,39 +1031,24 @@ class SearchSelectView(ui.View):
         for item in self.children:
             item.disabled = True
 
-        await interaction.response.edit_message(
-            content="❌ Pencarian lagu dibatalkan.",
-            embed=None,
-            view=self,
+        embed = discord.Embed(
+            title="❌ Pencarian Dibatalkan",
+            description="Pencarian lagu telah dibatalkan.",
+            color=discord.Color.dark_gray(),
         )
+        if interaction.response.is_done():
+            await interaction.edit_original_response(content=None, embed=embed, view=None)
+        else:
+            await interaction.response.edit_message(content=None, embed=embed, view=None)
 
-    async def select_callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.requester.id:
-            await interaction.response.send_message(
-                "❌ Hanya yang menjalankan perintah yang bisa memilih!",
-                ephemeral=True,
-            )
-            return
-
-        selected_idx = int(self.select_menu.values[0])
-        chosen_track = self.tracks[selected_idx]
-
-        song = Song(
-            title=chosen_track.get("title", "Unknown Title"),
-            url=chosen_track.get("url"),
-            webpage_url=chosen_track.get("webpage_url", ""),
-            duration=chosen_track.get("duration"),
-            thumbnail=chosen_track.get("thumbnail"),
-            uploader=chosen_track.get("uploader", "Unknown Artist"),
-            requester=self.requester,
-        )
-
-        # Matikan view setelah memilih
-        self.stop()
+    async def on_timeout(self):
         for item in self.children:
             item.disabled = True
-
-        await self.on_select_callback(interaction, song, self)
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
 
 
 class GenreSelectView(ui.View):

@@ -19,6 +19,7 @@ build/
 *.db
 *.sqlite
 *.sqlite3
+data/
 
 # ─── Logs ────────────────────────────────────────────────────────────
 logs/
@@ -41,3 +42,8 @@ desktop.ini
 # YouTube Cookies
 cookies.txt
 *cookies*.txt
+
+# n8n & Scripts
+n8n/
+scripts/
+*credentials*.json

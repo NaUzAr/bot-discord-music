@@ -1,0 +1,36 @@
+services:
+  discord-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discord-music-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PORT=8080
+      - DB_PATH=/app/data/voice_tracker.db
+    # Ports ditutup demi keamanan (Bot Discord tidak membutuhkan port masuk / inbound)
+    # ports:
+    #   - "127.0.0.1:8088:8080"
+    volumes:
+      # Penyimpanan data persisten untuk SQLite database & playlist
+      - ./data:/app/data
+      # File log persisten agar mudah dipantau langsung di VPS
+      - ./logs:/app/logs
+      # File cookies YouTube yang valid dari host
+      - ./cookies.txt:/app/cookies.txt
+      # Mount file kode langsung dari host agar pembaruan instan
+      - ./bot_music.py:/app/bot_music.py
+      - ./music_player.py:/app/music_player.py
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

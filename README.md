@@ -62,37 +62,96 @@ Bot Discord lengkap dengan fitur musik ala Rythm, penjaga voice channel 24/7 (*K
 
 ## 🚀 Panduan Instalasi (VPS / Server)
 
-### 1. Prasyarat Sistem
-Pastikan Python 3.10+ dan FFmpeg sudah terinstal di server:
+### 🐳 Metode 1: Deploy dengan Docker & Docker Compose (Direkomendasikan)
+
+Metode ini adalah cara paling mudah, stabil, dan terisolasi untuk menjalankan bot 24/7 di VPS Linux (Ubuntu, Debian, CentOS, dll.) tanpa repot menginstal dependensi manual seperti FFmpeg atau Opus.
+
+#### 1. Install Docker & Docker Compose di VPS (Ubuntu / Debian)
+Jika Docker belum terinstal di VPS Anda:
 ```bash
-sudo apt update && sudo apt install -y python3 python3-pip python3-venv ffmpeg git
+# Update sistem dan install curl & git
+sudo apt update && sudo apt install -y curl git
+
+# Install Docker resmi via script otomatis
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+
+# Beri izin user agar bisa menjalankan docker tanpa sudo (opsional)
+sudo usermod -aG docker $USER
+newgrp docker
 ```
 
-### 2. Clone Repository
+#### 2. Clone Repository
 ```bash
 git clone https://github.com/NaUzAr/bot-discord-music.git
 cd bot-discord-music
 ```
 
-### 3. Setup Virtual Environment
+#### 3. Konfigurasi Environment (`.env`)
+Salin template `.env.example` ke `.env`:
+```bash
+cp .env.example .env
+nano .env
+```
+Isi konfigurasi Anda:
+```env
+DISCORD_TOKEN=your_bot_token_here
+GEMINI_API_KEY=your_gemini_api_key_here
+PORT=8080
+DB_PATH=/app/data/voice_tracker.db
+
+# Opsional: Jika IP VPS Anda diblokir YouTube ("Sign in to confirm you're not a bot")
+# YOUTUBE_COOKIES_BASE64=
+```
+
+#### 4. Jalankan Bot
+Jalankan bot di latar belakang (*detached mode*):
+```bash
+docker compose up -d --build
+```
+
+#### 5. Cek Status, Log & Healthcheck
+```bash
+# Cek status kontainer (harus "Up" dan "(healthy)")
+docker compose ps
+
+# Pantau log bot secara real-time
+docker compose logs -f
+
+# Tes healthcheck endpoint
+curl http://localhost:8080/health
+```
+
+#### 🛠️ Perintah Manajemen Docker
+- **Stop bot**: `docker compose down`
+- **Restart bot**: `docker compose restart`
+- **Update ke versi terbaru dari GitHub**:
+  ```bash
+  git pull
+  docker compose up -d --build
+  ```
+
+> [!TIP]
+> **Data & Database Aman:** Database SQLite disimpan di folder `./data` di host VPS, sehingga data ranking voice dan playlist tidak akan hilang saat kontainer direstart atau di-rebuild!
+
+---
+
+### 💻 Metode 2: Deploy Manual (Virtualenv & Systemd)
+
+#### 1. Prasyarat Sistem
+Pastikan Python 3.10+ dan FFmpeg sudah terinstal di server:
+```bash
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv ffmpeg git
+```
+
+#### 2. Setup Virtual Environment
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Konfigurasi Environment (`.env`)
-Salin template `.env.example` ke `.env`:
-```bash
-cp .env.example .env
-nano .env
-```
-Isi dengan token bot kamu:
-```env
-DISCORD_TOKEN=your_bot_token_here
-```
-
-### 5. Jalankan Bot
+#### 3. Jalankan Bot
 - **Manual (Testing):**
   ```bash
   python bot_music.py
