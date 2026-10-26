@@ -88,6 +88,26 @@ _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name
 _file_handler.setLevel(logging.INFO)
 logging.getLogger().addHandler(_file_handler)
 
+# ─── 🔕 Global Silent Mode: Otomatis Jadikan Setiap Pesan Silent ─────────
+# Menghilangkan suara ping / push notifikasi Discord di HP & Desktop untuk SEMUA pesan bot
+_orig_messageable_send = discord.abc.Messageable.send
+async def _silent_messageable_send(self, *args, **kwargs):
+    kwargs.setdefault("silent", True)
+    return await _orig_messageable_send(self, *args, **kwargs)
+discord.abc.Messageable.send = _silent_messageable_send
+
+_orig_interaction_send_message = discord.InteractionResponse.send_message
+async def _silent_interaction_send_message(self, *args, **kwargs):
+    kwargs.setdefault("silent", True)
+    return await _orig_interaction_send_message(self, *args, **kwargs)
+discord.InteractionResponse.send_message = _silent_interaction_send_message
+
+_orig_webhook_send = discord.Webhook.send
+async def _silent_webhook_send(self, *args, **kwargs):
+    kwargs.setdefault("silent", True)
+    return await _orig_webhook_send(self, *args, **kwargs)
+discord.Webhook.send = _silent_webhook_send
+
 # ─── 🎨 Design System: Branding & Color Palette ─────────────────────
 class Theme:
     """Palet warna konsisten untuk semua embed bot."""
@@ -227,7 +247,10 @@ class RythmVoiceBot(discord.Client):
         intents.guilds = True
         intents.members = True
 
-        super().__init__(intents=intents)
+        super().__init__(
+            intents=intents,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         self.tree = app_commands.CommandTree(self)
 
         # Voice & Keep-alive tracking
