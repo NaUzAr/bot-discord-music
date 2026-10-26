@@ -98,11 +98,14 @@ check_status() {
     docker compose ps
     echo ""
     echo -e "${BOLD}🌐 Healthcheck Endpoint:${RESET}"
-    if curl -s -f http://localhost:8080/health &> /dev/null; then
+    if docker compose ps -q discord-bot &> /dev/null && docker compose exec discord-bot curl -s -f http://localhost:8080/health &> /dev/null; then
+        docker compose exec discord-bot curl -s http://localhost:8080/health | python3 -m json.tool 2>/dev/null || docker compose exec discord-bot curl -s http://localhost:8080/health
+        echo -e "\n${GREEN}✅ Healthcheck OK (Status Healthy)${NC}"
+    elif curl -s -f http://localhost:8080/health &> /dev/null; then
         curl -s http://localhost:8080/health | python3 -m json.tool 2>/dev/null || curl -s http://localhost:8080/health
         echo -e "\n${GREEN}✅ Healthcheck OK (Status Healthy)${NC}"
     else
-        echo -e "${YELLOW}⚠️ Tidak dapat menghubungi http://localhost:8080/health (Bot mungkin sedang startup atau offline).${NC}"
+        echo -e "${YELLOW}⚠️ Tidak dapat menghubungi healthcheck endpoint (Bot mungkin sedang startup atau offline).${NC}"
     fi
 }
 
