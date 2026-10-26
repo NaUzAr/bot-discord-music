@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import json
 import urllib.request
@@ -9,7 +10,7 @@ import asyncio
 import subprocess
 import shlex
 from dataclasses import dataclass
-from typing import Optional, List, Any, Set
+from typing import Optional, List, Any, Set, Dict
 import logging
 from dotenv import load_dotenv
 import discord
@@ -49,10 +50,12 @@ def get_ffmpeg_executable() -> str:
 FFMPEG_EXECUTABLE = get_ffmpeg_executable()
 
 # yt-dlp configurations — Kualitas Tertinggi (Opus 48kHz)
-# Setup cookies jika tersedia (untuk mengatasi blokir bot YouTube di hosting seperti Render)
+# Setup cookies jika tersedia (untuk mengatasi blokir bot YouTube di hosting seperti Render/VPS)
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 DATA_COOKIE_FILE = os.path.join(os.path.dirname(__file__), "data", "cookies.txt")
-if not os.path.exists(COOKIE_FILE) and os.path.exists(DATA_COOKIE_FILE):
+
+# Hindari error Docker jika folder cookies.txt terbentuk karena mount file yang belum ada
+if not os.path.isfile(COOKIE_FILE) and os.path.isfile(DATA_COOKIE_FILE):
     COOKIE_FILE = DATA_COOKIE_FILE
 
 _cookies_b64 = os.getenv("YOUTUBE_COOKIES_BASE64")
@@ -60,10 +63,13 @@ if _cookies_b64:
     try:
         import base64
         _decoded = base64.b64decode(_cookies_b64.strip())
-        _current_size = os.path.getsize(COOKIE_FILE) if os.path.exists(COOKIE_FILE) else 0
-        if not os.path.exists(COOKIE_FILE) or _current_size != len(_decoded):
-            with open(COOKIE_FILE, "wb") as f:
+        target_cookie_path = DATA_COOKIE_FILE if os.path.isdir(COOKIE_FILE) else COOKIE_FILE
+        os.makedirs(os.path.dirname(target_cookie_path), exist_ok=True)
+        _current_size = os.path.getsize(target_cookie_path) if os.path.isfile(target_cookie_path) else 0
+        if not os.path.isfile(target_cookie_path) or _current_size != len(_decoded):
+            with open(target_cookie_path, "wb") as f:
                 f.write(_decoded)
+            COOKIE_FILE = target_cookie_path
             logger.info("[yt-dlp] Berhasil membuat/memperbarui cookies.txt dari YOUTUBE_COOKIES_BASE64")
     except Exception as e:
         logger.warning(f"[yt-dlp] Gagal decode YOUTUBE_COOKIES_BASE64: {e}")
@@ -102,7 +108,7 @@ YTDL_OPTIONS_SC = {
     "default_search": "scsearch",
 }
 
-if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
+if os.path.isfile(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
     YTDL_OPTIONS["cookiefile"] = COOKIE_FILE
     logger.info(f"[yt-dlp] Menggunakan file cookies: {COOKIE_FILE}")
 else:
@@ -350,17 +356,70 @@ def format_duration(seconds: Optional[Any]) -> str:
         return "Live / Unknown"
 
 
+def is_playlist_url(url: str) -> bool:
+    """Mendeteksi apakah URL merupakan playlist (YouTube atau SoundCloud)."""
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return False
+    u = url.lower()
+    return ("list=" in u and ("youtube.com" in u or "youtu.be" in u)) or ("soundcloud.com" in u and "/sets/" in u)
+
+
+def resolve_spotify_track(url: str) -> Optional[Dict[str, str]]:
+    """
+    Mengekstrak judul dan artis dari URL lagu Spotify (open.spotify.com/track/...)
+    menggunakan Spotify oEmbed API dan metadata publik tanpa perlu API key Spotify.
+    """
+    if "open.spotify.com/track/" not in url:
+        return None
+    try:
+        clean_url = url.split("?")[0]
+        oembed_url = f"https://open.spotify.com/oembed?url={clean_url}"
+        req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        raw_title = data.get("title", "")
+        thumbnail = data.get("thumbnail_url")
+
+        artist = ""
+        try:
+            page_req = urllib.request.Request(clean_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(page_req, timeout=4) as page_resp:
+                html = page_resp.read().decode("utf-8", errors="ignore")
+                m = re.search(r"<title>(.*?)</title>", html)
+                if m:
+                    full_title = m.group(1)
+                    by_match = re.search(r"\bby\s+(.*?)\s*\|\s*Spotify", full_title, re.IGNORECASE)
+                    if by_match:
+                        artist = by_match.group(1).strip()
+        except Exception:
+            pass
+
+        search_query = f"{artist} - {raw_title}".strip(" -") if artist else raw_title
+        return {
+            "title": raw_title,
+            "artist": artist or "Spotify Artist",
+            "search_query": search_query,
+            "thumbnail": thumbnail,
+            "webpage_url": clean_url,
+        }
+    except Exception as e:
+        logger.warning(f"Gagal resolve Spotify URL '{url}': {e}")
+        return None
+
+
 @dataclass
 class Song:
     title: str
     url: str  # direct audio stream URL
-    webpage_url: str  # YouTube page URL
+    webpage_url: str  # YouTube / Spotify / SoundCloud page URL
     duration: Optional[int]
     thumbnail: Optional[str]
     uploader: str
     requester: Any
     is_podcast: bool = False
     ai_context: Optional[dict] = None
+    source_provider: str = "youtube"
 
     @property
     def duration_str(self) -> str:
@@ -368,7 +427,7 @@ class Song:
 
 
 class YTDLSource:
-    """Helper untuk extract audio stream dari YouTube atau search query."""
+    """Helper untuk extract audio stream dari YouTube, Spotify, atau search query."""
 
     @classmethod
     async def extract_info(cls, query: str, download: bool = False, custom_ytdl: Optional[Any] = None):
@@ -381,6 +440,40 @@ class YTDLSource:
             )
         except Exception as e:
             logger.error(f"yt-dlp extract_info error untuk query '{query}': {e}")
+            return None
+
+    @classmethod
+    async def extract_playlist(cls, url: str, max_songs: int = 50) -> Optional[Dict[str, Any]]:
+        """Mengekstrak daftar entri lagu dari playlist (YouTube / SoundCloud) secara cepat (flat extraction)."""
+        loop = asyncio.get_event_loop()
+        opts = {
+            "extract_flat": "in_playlist",
+            "quiet": True,
+            "skip_download": True,
+            "ignoreerrors": True,
+            "no_warnings": True,
+        }
+        if os.path.isfile(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
+            opts["cookiefile"] = COOKIE_FILE
+
+        def _fetch():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+
+        try:
+            data = await loop.run_in_executor(None, _fetch)
+            if not data:
+                return None
+
+            entries = [e for e in data.get("entries", []) if e][:max_songs]
+            return {
+                "title": data.get("title", "Playlist"),
+                "entries": entries,
+                "uploader": data.get("uploader", "Various Artists"),
+                "total_count": len(data.get("entries", [])),
+            }
+        except Exception as e:
+            logger.warning(f"Gagal ekstrak playlist '{url}': {e}")
             return None
 
     @classmethod
@@ -443,8 +536,28 @@ class YTDLSource:
     ) -> Optional[Song]:
         """Mendapatkan single song dari URL atau keyword pencarian.
 
-        Mendukung retry multi-client YouTube dan fallback otomatis ke SoundCloud jika YouTube diblokir di cloud/VPS.
+        Mendukung Spotify URLs, retry multi-client YouTube, dan fallback otomatis ke SoundCloud jika YouTube diblokir.
         """
+        # 0. Handle Spotify Track URL secara otomatis
+        if "open.spotify.com/track/" in query:
+            spotify_info = resolve_spotify_track(query)
+            if spotify_info:
+                logger.info(f"🟢 Spotify track terdeteksi: '{spotify_info['search_query']}'")
+                song = await cls.get_song(
+                    spotify_info["search_query"],
+                    requester=requester,
+                    is_podcast=is_podcast,
+                    ai_context=ai_context,
+                )
+                if song:
+                    song.webpage_url = spotify_info["webpage_url"]
+                    if spotify_info.get("thumbnail"):
+                        song.thumbnail = spotify_info["thumbnail"]
+                    if spotify_info.get("artist") and song.uploader in ["Unknown Artist", "Unknown"]:
+                        song.uploader = spotify_info["artist"]
+                    song.source_provider = "spotify"
+                    return song
+
         is_url = query.startswith("http://") or query.startswith("https://")
         search_query = query if is_url else f"ytsearch1:{query}"
 
@@ -574,6 +687,15 @@ class YTDLSource:
             except (ValueError, TypeError):
                 dur_int = None
 
+        # Tentukan provider audio aktual
+        stream_url = data.get("url", "")
+        if "sndcdn.com" in stream_url or "soundcloud.com" in stream_url or data.get("extractor_key") == "Soundcloud":
+            source_provider = "soundcloud"
+        elif any(k in stream_url for k in ["googlevideo.com", "youtube.com"]):
+            source_provider = "youtube"
+        else:
+            source_provider = "direct"
+
         # Prioritaskan judul, thumbnail, dan uploader asli dari YouTube jika query adalah link YouTube
         final_title = (fallback_title if (is_url and fallback_title) else None) or data.get("title", "Unknown Title")
         final_thumbnail = (fallback_thumbnail if (is_url and fallback_thumbnail) else None) or data.get("thumbnail")
@@ -589,6 +711,7 @@ class YTDLSource:
             requester=requester,
             is_podcast=is_podcast,
             ai_context=ai_context,
+            source_provider=source_provider,
         )
 
 
@@ -671,16 +794,28 @@ class PipedFFmpegAudio(discord.AudioSource):
         self.ffmpeg_proc: Optional[subprocess.Popen] = None
         self.ytdlp_proc: Optional[subprocess.Popen] = None
 
-        ytdlp_cmd = [
-            "yt-dlp",
+        # Cari binary yt-dlp di sistem atau gunakan interpreter python saat ini (aman untuk venv & systemd)
+        which_ytdlp = shutil.which("yt-dlp")
+        if which_ytdlp:
+            ytdlp_cmd = [which_ytdlp]
+        else:
+            ytdlp_cmd = [sys.executable, "-m", "yt_dlp"]
+
+        ytdlp_cmd.extend([
             "-f", "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/best",
             "--no-warnings",
             "--quiet",
             "--no-playlist",
+            "--js-runtimes", "node,deno,bun",
             "-o", "-",
-        ]
-        if cookie_file and os.path.exists(cookie_file) and os.path.getsize(cookie_file) > 0:
+        ])
+        if cookie_file and os.path.isfile(cookie_file) and os.path.getsize(cookie_file) > 0:
             ytdlp_cmd.extend(["--cookies", cookie_file])
+        else:
+            ytdlp_cmd.extend([
+                "--extractor-args",
+                "youtube:player_client=android,web_embedded,mweb;player_skip=webpage,configs"
+            ])
 
         ytdlp_cmd.append(source)
 
@@ -752,8 +887,14 @@ class PipedFFmpegAudio(discord.AudioSource):
 
 def is_youtube_source(song: Song) -> bool:
     """Mengecek apakah audio berasal dari YouTube yang membutuhkan piping yt-dlp."""
-    target = f"{song.webpage_url or ''} {song.url or ''}".lower()
-    return any(k in target for k in ["youtube.com", "youtu.be", "googlevideo.com"])
+    if getattr(song, "source_provider", None) in ["soundcloud", "direct"]:
+        return False
+    target_stream = (song.url or "").lower()
+    # Jika URL stream langsung ke CDN SoundCloud atau file langsung, bukan YouTube
+    if "sndcdn.com" in target_stream or "soundcloud.com" in target_stream:
+        return False
+    target_page = (song.webpage_url or "").lower()
+    return any(k in target_stream or k in target_page for k in ["youtube.com", "youtu.be", "googlevideo.com"])
 
 
 def create_audio_source(
@@ -776,16 +917,24 @@ def create_audio_source(
         before_opts = f"-ss {int(start_time)}" if (start_time and start_time > 0) else ""
         cookie_to_use = (
             COOKIE_FILE
-            if (os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0)
+            if (os.path.isfile(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0)
             else None
         )
-        return PipedFFmpegAudio(
-            target_url,
-            cookie_file=cookie_to_use,
-            ffmpeg_executable=FFMPEG_EXECUTABLE,
-            before_options=before_opts,
-            options=ffmpeg_opts.get("options", ""),
-        )
+        try:
+            return PipedFFmpegAudio(
+                target_url,
+                cookie_file=cookie_to_use,
+                ffmpeg_executable=FFMPEG_EXECUTABLE,
+                before_options=before_opts,
+                options=ffmpeg_opts.get("options", ""),
+            )
+        except Exception as e:
+            logger.warning(f"PipedFFmpegAudio gagal ({e}), fallback ke direct stream: {song.title}")
+            return discord.FFmpegPCMAudio(
+                song.url,
+                executable=FFMPEG_EXECUTABLE,
+                **ffmpeg_opts,
+            )
     else:
         return discord.FFmpegPCMAudio(
             song.url,

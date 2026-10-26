@@ -23,6 +23,13 @@ services:
       # Mount file kode langsung dari host agar pembaruan instan
       - ./bot_music.py:/app/bot_music.py
       - ./music_player.py:/app/music_player.py
+      - ./database.py:/app/database.py
+      - ./web_dashboard.py:/app/web_dashboard.py
+      - ./ai_playlist.py:/app/ai_playlist.py
+      - ./lyrics_manager.py:/app/lyrics_manager.py
+      - ./sleep_timer.py:/app/sleep_timer.py
+      - ./pomodoro.py:/app/pomodoro.py
+      - ./podcast_manager.py:/app/podcast_manager.py
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s

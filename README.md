@@ -6,12 +6,13 @@ Bot Discord lengkap dengan fitur musik ala Rythm, penjaga voice channel 24/7 (*K
 
 ## ✨ Fitur Utama
 
-1. **Music Player (Full Controls & Advanced Playback)**
-   - `/play <query/url>`: Memutar musik dari YouTube (judul atau direct link).
+1. **Music Player (Full Controls & Universal Streaming)**
+   - `/play <query/url>`: Memutar musik dari YouTube, Spotify Track Link (`open.spotify.com/track/...`), SoundCloud, atau YouTube Playlist URL (otomatis antrekan album/playlist sekaligus!).
    - `/search <query>`: Menampilkan 5 pilihan lagu teratas dalam interactive Dropdown Menu.
    - `/shuffle`: Mengacak antrean lagu secara instan (Fisher-Yates shuffle).
    - `/seek <waktu>`: Melompat ke detik atau menit tertentu (`01:30`) secara hot-reload.
    - `/history`: Melihat 20 riwayat lagu terakhir yang telah diputar.
+   - `/diag`: Uji diagnostik kesehatan bot, audio latency, SQLite async I/O, dan koneksi Gemini AI langsung dari Discord.
    - `/queue`, `/nowplaying`, `/skip`, `/pause`, `/resume`, `/stop`, `/loop`, `/volume`.
    - **Loop Bypass**: Fitur force skip cerdas agar perintah `/skip` tetap bekerja normal saat mode repeat/looping aktif.
 
@@ -62,7 +63,28 @@ Bot Discord lengkap dengan fitur musik ala Rythm, penjaga voice channel 24/7 (*K
 
 ## 🚀 Panduan Instalasi (VPS / Server)
 
-### 🐳 Metode 1: Deploy dengan Docker & Docker Compose (Direkomendasikan)
+### ⚡ Cara Instan: 1-Click VPS Runner Script (`run_vps.sh`)
+Bot ini sudah dilengkapi skrip otomatis `run_vps.sh` yang menangani instalasi Docker, validasi file, background 24/7 run, pemantauan log, dan diagnosa bug dalam satu menu interaktif:
+
+```bash
+# 1. Berikan izin eksekusi skrip
+chmod +x run_vps.sh
+
+# 2. Jalankan menu interaktif
+./run_vps.sh
+```
+
+Atau jalankan perintah langsung (CLI shortcuts):
+- `./run_vps.sh start` — Jalankan bot 24/7 di latar belakang
+- `./run_vps.sh status` — Cek status kontainer & healthcheck `/health`
+- `./run_vps.sh logs` — Pantau log bot secara real-time
+- `./run_vps.sh update` — Tarik update dari GitHub & rebuild otomatis
+- `./run_vps.sh test` — Jalankan uji diagnostik sistem & bug
+- `./run_vps.sh stop` — Hentikan bot
+
+---
+
+### 🐳 Metode 1: Deploy dengan Docker & Docker Compose Manual (Direkomendasikan)
 
 Metode ini adalah cara paling mudah, stabil, dan terisolasi untuk menjalankan bot 24/7 di VPS Linux (Ubuntu, Debian, CentOS, dll.) tanpa repot menginstal dependensi manual seperti FFmpeg atau Opus.
 

@@ -4,9 +4,17 @@ import aiosqlite
 from datetime import datetime, timezone
 import logging
 from typing import Optional, List, Dict, Any
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger("VoiceDB")
 DB_PATH = os.getenv("DB_PATH", "voice_tracker.db")
+
+# Fallback path jika berjalan di luar container Docker (misal local Windows / server tanpa /app)
+if DB_PATH.startswith("/app") and not os.path.exists("/app"):
+    DB_PATH = os.path.join(os.path.dirname(__file__), "data", "voice_tracker.db")
+
 db_dir = os.path.dirname(DB_PATH)
 if db_dir:
     os.makedirs(db_dir, exist_ok=True)

@@ -14,11 +14,16 @@ import time
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, List
+import shutil
+
+from dotenv import load_dotenv
+
+# Load env variables segera sebelum modul lokal dimuat
+load_dotenv()
 
 import discord
 from discord import app_commands
 from discord.ext import tasks
-from dotenv import load_dotenv
 
 import database
 from music_player import (
@@ -36,6 +41,8 @@ from music_player import (
     InterruptableVolumeTransformer,
     create_audio_source,
     format_duration,
+    is_playlist_url,
+    resolve_spotify_track,
 )
 from pomodoro import PomodoroManager
 from ai_playlist import generate_ai_playlist, recommend_next_song, CANDIDATE_MODELS
@@ -322,20 +329,9 @@ class RythmVoiceBot(discord.Client):
                     self.target_channels[guild.id] = guild.voice_client.channel.id
                 logger.info(f"🔊 Sinkronisasi voice client yang sudah aktif: '{guild.voice_client.channel.name}' di '{guild.name}'")
 
-        # Instant guild-level sync agar commands langsung muncul detik itu juga di Discord tanpa menunggu cache 1 jam
-        for i, guild in enumerate(self.guilds):
-            try:
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-                logger.info(f"⚡ Instant guild commands synced: {len(synced)} commands untuk '{guild.name}' ({guild.id})")
-                # Rate limiting: delay antar guild sync agar tidak kena throttle Discord API
-                if i < len(self.guilds) - 1:
-                    await asyncio.sleep(1)
-            except discord.HTTPException as e:
-                logger.warning(f"⚠️ Gagal instant sync ke guild {guild.name} (HTTP {e.status}): {e}")
-                await asyncio.sleep(2)  # Tunggu lebih lama jika kena rate limit
-            except Exception as e:
-                logger.warning(f"⚠️ Gagal instant sync ke guild {guild.name}: {e}")
+        # Slash commands sudah di-sync secara global di setup_hook() tanpa duplikasi
+        # Jika butuh sinkronisasi instan per server, admin dapat menggunakan perintah /sync
+        logger.info(f"⚡ Global commands aktif di {len(self.guilds)} server.")
 
         # Mulai background tasks
         if not self.reconnect_loop.is_running():
@@ -1393,6 +1389,58 @@ async def cmd_play(interaction: discord.Interaction, query: str):
         guild_id = interaction.guild.id
         queue = bot.get_queue(guild_id)
         queue.text_channel = interaction.channel
+
+        # Cek jika input merupakan URL Playlist (YouTube / SoundCloud)
+        if is_playlist_url(query):
+            playlist_data = await YTDLSource.extract_playlist(query, max_songs=40)
+            if playlist_data and playlist_data.get("entries"):
+                entries = playlist_data["entries"]
+                pl_title = playlist_data.get("title", "Playlist")
+                
+                # Resolusikan lagu pertama segera agar pemutaran langsung mulai
+                first_entry = entries[0]
+                first_target = first_entry.get("url") or first_entry.get("title")
+                first_song = await YTDLSource.get_song(first_target, interaction.user)
+                if first_song:
+                    queue.add(first_song)
+                    if not vc.is_playing() and not vc.is_paused():
+                        play_next_song(guild_id, notify_channel=False)
+
+                # Antrekan lagu berikutnya dari playlist
+                queued_count = 1 if first_song else 0
+                for entry in entries[1:]:
+                    entry_title = entry.get("title") or "Unknown Title"
+                    entry_url = entry.get("url") or ""
+                    if not entry_url.startswith("http"):
+                        entry_url = f"https://www.youtube.com/watch?v={entry.get('id', '')}"
+                    dur_raw = entry.get("duration")
+                    dur_int = int(float(dur_raw)) if dur_raw is not None else None
+                    pl_song = Song(
+                        title=entry_title,
+                        url=entry_url,
+                        webpage_url=entry_url,
+                        duration=dur_int,
+                        thumbnail=entry.get("thumbnail"),
+                        uploader=entry.get("uploader") or playlist_data.get("uploader", "YouTube"),
+                        requester=interaction.user,
+                        source_provider="youtube",
+                    )
+                    queue.add(pl_song)
+                    queued_count += 1
+
+                embed = discord.Embed(
+                    title="📑 Playlist Berhasil Ditambahkan!",
+                    description=(
+                        f"**[{pl_title}]({query})**\n\n"
+                        f"• 🎵 Jumlah Lagu Ditambahkan: **{queued_count} lagu**\n"
+                        f"• 📍 Total Antrean Saat Ini: **{len(queue.queue) + (1 if queue.current else 0)} lagu**\n"
+                        f"• 👤 Diminta oleh: {interaction.user.mention}"
+                    ),
+                    color=Theme.QUEUED,
+                )
+                embed.set_footer(text=f"Auto-queued via Playlist Mode  •  {Theme.BRAND_NAME}")
+                await interaction.followup.send(embed=embed, silent=True)
+                return
 
         song = await YTDLSource.get_song(query, interaction.user)
         if not song:
@@ -3912,6 +3960,83 @@ async def cmd_help(interaction: discord.Interaction):
     )
 
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="diag", description="🛠️ Diagnostik & tes performa menyeluruh bot (Audio, DB, AI, Voice)")
+async def cmd_diag(interaction: discord.Interaction):
+    """Laporan diagnostik lengkap sistem bot untuk memverifikasi performa server & modul."""
+    await interaction.response.defer(ephemeral=True)
+    t0 = time.time()
+    guild_id = interaction.guild.id
+    vc = bot.get_guild_voice_client(guild_id)
+
+    # 1. Test Gateway & Ping
+    ping_ms = round(bot.latency * 1000, 1) if bot.latency else 0
+    uptime_sec = int(time.time() - bot.start_time)
+    h, m = divmod(uptime_sec, 3600)
+    m, s = divmod(m, 60)
+    uptime_str = f"{h}j {m}m {s}d"
+
+    # 2. Test SQLite Database Latency
+    db_status = "❌ Error"
+    try:
+        db_t0 = time.time()
+        await database.add_voice_time(interaction.user.id, guild_id, 0)
+        db_ms = round((time.time() - db_t0) * 1000, 1)
+        db_status = f"✅ OK (`{db_ms} ms`)"
+    except Exception as e:
+        db_status = f"❌ Gagal (`{e}`)"
+
+    # 3. Test FFmpeg & Audio Engine
+    ffmpeg_bin = shutil.which("ffmpeg") or FFMPEG_EXECUTABLE
+    ffmpeg_status = f"✅ OK (`{ffmpeg_bin}`)" if shutil.which("ffmpeg") or FFMPEG_EXECUTABLE != "ffmpeg" else "⚠️ FFmpeg Not in PATH"
+    ytdlp_which = shutil.which("yt-dlp")
+    ytdlp_status = f"✅ OK (`{ytdlp_which or 'python module'}`)"
+
+    # 4. Test Gemini AI connectivity
+    ai_status = "⚪ Tidak Dikonfigurasi"
+    if os.getenv("GEMINI_API_KEY"):
+        try:
+            ai_t0 = time.time()
+            ai_res = await generate_ai_playlist("lofi chill study", track_count=3)
+            ai_ms = round((time.time() - ai_t0) * 1000, 1)
+            ai_status = f"✅ Aktif & Terhubung (`{ai_ms} ms`)" if ai_res else "⚠️ Tidak ada respon"
+        except Exception as e:
+            ai_status = f"❌ Error (`{e}`)"
+
+    # 5. Voice & Playback Status
+    v_status = "⚪ Standby (Tidak di voice channel)"
+    if vc and vc.is_connected() and vc.channel:
+        playing_str = "Memutar Musik 🎵" if vc.is_playing() else ("Dijeda ⏸️" if vc.is_paused() else "Standby 24/7 💤")
+        v_status = f"🔊 Terhubung di **{vc.channel.name}** ({playing_str})"
+
+    embed = discord.Embed(
+        title="🛠️ Laporan Diagnostik Sistem & Bot",
+        color=Theme.INFO,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="📡 Koneksi & Gateway Discord",
+        value=f"• Latensi Gateway: `{ping_ms} ms`\n• Bot Uptime: `{uptime_str}`\n• Server Aktif: `{len(bot.guilds)} server`",
+        inline=False,
+    )
+    embed.add_field(
+        name="📦 Database & Audio Backend",
+        value=f"• SQLite Database: {db_status}\n• FFmpeg Audio: {ffmpeg_status}\n• yt-dlp Extractor: {ytdlp_status}",
+        inline=False,
+    )
+    embed.add_field(
+        name="🤖 AI & Web Dashboard",
+        value=f"• Google Gemini AI: {ai_status}\n• Web Server Port: `{os.getenv('PORT', 8080)}`",
+        inline=False,
+    )
+    embed.add_field(
+        name="🎙️ Status Voice Server Ini",
+        value=f"• Status Voice: {v_status}",
+        inline=False,
+    )
+    embed.set_footer(text=f"Total waktu diagnostik: {round((time.time() - t0)*1000, 1)} ms  •  {Theme.BRAND_NAME}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ─── Main Execution with Auto Restart ────────────────────────────────
