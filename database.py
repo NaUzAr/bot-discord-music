@@ -2,6 +2,7 @@ import os
 import json
 import aiosqlite
 from datetime import datetime, timezone
+import sys
 import logging
 from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
@@ -12,8 +13,15 @@ logger = logging.getLogger("VoiceDB")
 DB_PATH = os.getenv("DB_PATH", "voice_tracker.db")
 
 # Fallback path jika berjalan di luar container Docker (misal local Windows / server tanpa /app)
-if DB_PATH.startswith("/app") and not os.path.exists("/app"):
-    DB_PATH = os.path.join(os.path.dirname(__file__), "data", "voice_tracker.db")
+if DB_PATH.startswith("/app") and (not os.path.exists("/app") or sys.platform == "win32"):
+    local_data_db = os.path.join(os.path.dirname(__file__), "data", "voice_tracker.db")
+    local_root_db = os.path.join(os.path.dirname(__file__), "voice_tracker.db")
+    if os.path.exists(local_data_db):
+        DB_PATH = local_data_db
+    elif os.path.exists(local_root_db):
+        DB_PATH = local_root_db
+    else:
+        DB_PATH = local_data_db
 
 db_dir = os.path.dirname(DB_PATH)
 if db_dir:
@@ -220,7 +228,9 @@ async def save_playlist(
 async def load_playlist(
     user_id: int, guild_id: int, name: str
 ) -> Optional[List[Dict[str, Any]]]:
-    """Memuat data lagu dari playlist berdasarkan nama."""
+    """Memuat data lagu dari playlist berdasarkan nama.
+    Mencari milik user terlebih dahulu, jika tidak ada mencoba mencari playlist dengan nama sama di guild.
+    """
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
@@ -228,6 +238,14 @@ async def load_playlist(
                 (user_id, guild_id, name),
             ) as cursor:
                 row = await cursor.fetchone()
+
+            # Fallback jika playlist tersimpan di server oleh member lain
+            if not row:
+                async with db.execute(
+                    "SELECT tracks FROM playlists WHERE guild_id = ? AND LOWER(name) = LOWER(?) ORDER BY id DESC LIMIT 1",
+                    (guild_id, name),
+                ) as cursor:
+                    row = await cursor.fetchone()
 
         if row:
             return json.loads(row[0])
@@ -238,17 +256,28 @@ async def load_playlist(
 
 
 async def get_playlists(user_id: int, guild_id: int) -> List[Dict[str, Any]]:
-    """Mengambil daftar semua playlist milik user di guild tertentu."""
+    """Mengambil daftar semua playlist milik user atau yang tersedia di guild tertentu."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
-                "SELECT name, tracks, created_at FROM playlists WHERE user_id = ? AND guild_id = ? ORDER BY created_at DESC",
-                (user_id, guild_id),
+                """
+                SELECT name, tracks, created_at FROM playlists 
+                WHERE user_id = ? AND guild_id = ? 
+                UNION
+                SELECT name, tracks, created_at FROM playlists 
+                WHERE guild_id = ?
+                ORDER BY created_at DESC
+                """,
+                (user_id, guild_id, guild_id),
             ) as cursor:
                 rows = await cursor.fetchall()
 
         results = []
+        seen_names = set()
         for name, tracks_json, created_at in rows:
+            if name in seen_names:
+                continue
+            seen_names.add(name)
             tracks = json.loads(tracks_json)
             results.append(
                 {
