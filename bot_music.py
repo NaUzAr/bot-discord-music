@@ -715,7 +715,12 @@ class MusicControlView(discord.ui.View):
         self.btn_queue.label = f"Antrean ({q_count})" if q_count > 0 else "Antrean"
         self.btn_queue.style = discord.ButtonStyle.secondary
 
-        # 4. AutoPlay Button
+        # 4. Shuffle Button
+        self.btn_shuffle.emoji = "🔀"
+        self.btn_shuffle.label = "Acak"
+        self.btn_shuffle.style = discord.ButtonStyle.secondary
+
+        # 5. AutoPlay Button
         is_autoplay = queue.autoplay if queue else False
         self.btn_autoplay.emoji = "📻"
         self.btn_autoplay.label = "Auto: ON" if is_autoplay else "Auto: OFF"
@@ -816,6 +821,49 @@ class MusicControlView(discord.ui.View):
 
         total_songs = len(queue.queue) + (1 if queue.current else 0)
         embed.set_footer(text=f"Total: {total_songs} lagu  •  {Theme.BRAND_NAME}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Acak", emoji="🔀", style=discord.ButtonStyle.secondary, custom_id="mctrl_shuffle")
+    async def btn_shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        guild_id = self.guild_id or interaction.guild_id
+        vc = self.bot.get_guild_voice_client(guild_id)
+        queue = self.bot.get_queue(guild_id)
+
+        user = interaction.user
+        if not user.voice or not user.voice.channel or not vc or not vc.channel or user.voice.channel.id != vc.channel.id:
+            ch_name = f"🔊 {vc.channel.name}" if (vc and vc.channel) else "voice channel bot"
+            await interaction.followup.send(
+                f"❌ Kamu harus berada di voice channel yang sama dengan bot ({ch_name}) untuk mengacak antrean!",
+                ephemeral=True,
+            )
+            return
+
+        if not queue or not queue.queue or len(queue.queue) < 2:
+            await interaction.followup.send("❌ Antrean terlalu sedikit untuk diacak! Minimal 2 lagu di antrean.", ephemeral=True)
+            return
+
+        random.shuffle(queue.queue)
+        self._sync_states(guild_id)
+        try:
+            if interaction.message:
+                await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+        lines = []
+        for i, s in enumerate(queue.queue[:6], 1):
+            clean = s.title[:35] + ("…" if len(s.title) > 35 else "")
+            lines.append(f"`{i}.` {clean} · `{s.duration_str}`")
+        if len(queue.queue) > 6:
+            lines.append(f"*...dan {len(queue.queue) - 6} lagu lainnya.*")
+
+        embed = styled_embed(
+            title="🔀 Antrean Berhasil Diacak!",
+            description=f"**{len(queue.queue)} lagu** dalam antrean telah diacak urutannya.",
+            color=Theme.SUCCESS,
+        )
+        add_safe_fields(embed, "📋 6 Lagu Berikutnya", lines, max_chars=950)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="Auto: OFF", emoji="📻", style=discord.ButtonStyle.secondary, custom_id="mctrl_autoplay")
@@ -1697,15 +1745,10 @@ async def cmd_clear(interaction: discord.Interaction):
     await interaction.response.send_message(f"🧹 Berhasil menghapus seluruh antrean (**{count} lagu**).")
 
 
-@bot.tree.command(name="queue", description="📜 Lihat daftar antrean lagu")
-async def cmd_queue(interaction: discord.Interaction):
-    queue = bot.get_queue(interaction.guild.id)
+def build_queue_embed(guild_id: int) -> discord.Embed:
+    """Membuat embed representasi antrean lagu saat ini."""
+    queue = bot.get_queue(guild_id)
 
-    if not queue.current and not queue.queue:
-        await interaction.response.send_message("📭 Antrean musik sedang kosong!", ephemeral=True)
-        return
-
-    # Hitung total durasi
     total_dur = sum(s.duration or 0 for s in queue.queue) + (queue.current.duration or 0 if queue.current else 0)
     total_dur_str = format_duration(total_dur) if total_dur > 0 else "N/A"
 
@@ -1735,22 +1778,63 @@ async def cmd_queue(interaction: discord.Interaction):
         queue_lines = []
         for i, song in enumerate(queue.queue[:10], start=1):
             clean_title = song.title[:35] + ("…" if len(song.title) > 35 else "")
-            queue_lines.append(f"`{i}.` [{clean_title}]({song.webpage_url}) · `{song.duration_str}` — {song.requester.mention}")
+            req_mention = song.requester.mention if (song.requester and hasattr(song.requester, "mention")) else "AutoPlay"
+            queue_lines.append(f"`{i}.` [{clean_title}]({song.webpage_url}) · `{song.duration_str}` — {req_mention}")
         if len(queue.queue) > 10:
             queue_lines.append(f"*...dan {len(queue.queue) - 10} lagu lainnya.*")
         add_safe_fields(embed, name="📋 Berikutnya", lines=queue_lines, max_chars=950, inline=False)
     else:
         embed.add_field(name="📋 Berikutnya", value="*Antrean kosong — AutoPlay akan memilih lagu otomatis.*", inline=False)
 
-    # Status bar bawah
     total_songs = len(queue.queue) + (1 if queue.current else 0)
     loop_str = "🔁 On" if queue.is_looping else "➡️ Off"
     auto_str = "📻 On" if queue.autoplay else "⏹️ Off"
     status_line = f"`{total_songs} lagu` · ⏱️ `{total_dur_str}` · Loop: {loop_str} · AutoPlay: {auto_str}"
     embed.add_field(name="", value=status_line, inline=False)
-
     embed.set_footer(text=Theme.BRAND_NAME)
-    await interaction.response.send_message(embed=embed)
+    return embed
+
+
+class QueueControlView(discord.ui.View):
+    """View kontrol interaktif untuk antrean musik (/queue) dengan tombol Acak dan Refresh."""
+
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="Acak Antrean", emoji="🔀", style=discord.ButtonStyle.secondary)
+    async def btn_shuffle_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = await check_same_voice_channel(interaction)
+        if not vc:
+            return
+
+        queue = bot.get_queue(self.guild_id)
+        if not queue.queue or len(queue.queue) < 2:
+            await interaction.response.send_message("❌ Antrean terlalu sedikit untuk diacak! Minimal 2 lagu.", ephemeral=True)
+            return
+
+        random.shuffle(queue.queue)
+        new_embed = build_queue_embed(self.guild_id)
+        await interaction.response.edit_message(embed=new_embed, view=self)
+        await interaction.followup.send("🔀 Antrean musik berhasil diacak!", ephemeral=True)
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary)
+    async def btn_refresh_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        new_embed = build_queue_embed(self.guild_id)
+        await interaction.response.edit_message(embed=new_embed, view=self)
+
+
+@bot.tree.command(name="queue", description="📜 Lihat daftar antrean lagu")
+async def cmd_queue(interaction: discord.Interaction):
+    queue = bot.get_queue(interaction.guild.id)
+
+    if not queue.current and not queue.queue:
+        await interaction.response.send_message("📭 Antrean musik sedang kosong!", ephemeral=True)
+        return
+
+    embed = build_queue_embed(interaction.guild.id)
+    view = QueueControlView(interaction.guild.id)
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 @bot.tree.command(name="nowplaying", description="🎧 Info lagu yang sedang berputar")
@@ -1880,6 +1964,12 @@ async def cmd_shuffle(interaction: discord.Interaction):
     )
     add_safe_fields(embed, "📋 Urutan Baru", lines, max_chars=950)
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="acak", description="🔀 Acak urutan antrean lagu (alias untuk /shuffle)")
+async def cmd_acak(interaction: discord.Interaction):
+    """Mengacak urutan antrean lagu (alias untuk perintah /shuffle)."""
+    await cmd_shuffle(interaction)
 
 
 @bot.tree.command(name="seek", description="⏩ Loncat ke posisi waktu tertentu dalam lagu yang sedang diputar")
@@ -2715,9 +2805,12 @@ async def playlist_save(interaction: discord.Interaction, nama: str):
 
 
 @playlist_group.command(name="load", description="📂 Muat playlist yang sudah disimpan ke dalam antrean")
-@app_commands.describe(nama="Pilih playlist yang ingin dimuat")
+@app_commands.describe(
+    nama="Pilih playlist yang ingin dimuat",
+    acak="Acak urutan lagu dalam playlist saat dimuat (opsional)",
+)
 @app_commands.autocomplete(nama=playlist_autocomplete)
-async def playlist_load(interaction: discord.Interaction, nama: str):
+async def playlist_load(interaction: discord.Interaction, nama: str, acak: bool = False):
     await interaction.response.defer()
     tracks = await database.load_playlist(
         interaction.user.id, interaction.guild.id, nama.strip()
@@ -2728,6 +2821,9 @@ async def playlist_load(interaction: discord.Interaction, nama: str):
             f"❌ Playlist **`{nama}`** tidak ditemukan atau kosong!", ephemeral=True
         )
         return
+
+    if acak:
+        random.shuffle(tracks)
 
     vc = await ensure_voice_connection(interaction)
     if not vc:
@@ -2772,8 +2868,9 @@ async def playlist_load(interaction: discord.Interaction, nama: str):
         play_next_song(guild_id)
 
     # Kirim respons awal cepat ke user (Musik sudah langsung berputar!)
+    mode_str = " *(Urutan Diacak 🔀)*" if acak else ""
     initial_desc = (
-        f"Memuat playlist **`{nama}`** ({total_playlist_tracks} lagu).\n\n"
+        f"Memuat playlist **`{nama}`**{mode_str} ({total_playlist_tracks} lagu).\n\n"
         f"▶️ **Sedang Diputar:** [{first_song.title}]({first_song.webpage_url})\n"
     )
     if total_playlist_tracks > 1:
