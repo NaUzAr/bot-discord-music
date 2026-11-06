@@ -527,6 +527,43 @@ class YTDLSource:
         return entries
 
     @classmethod
+    async def get_youtube_related_tracks(cls, video_url_or_id: str, max_results: int = 10) -> List[dict]:
+        """Mengambil daftar lagu Up Next / YouTube Mix (RD Playlist) persis seperti fitur Autoplay di YouTube."""
+        vid_match = re.search(r"(?:v=|\/|be\/)([a-zA-Z0-9_-]{11})", video_url_or_id)
+        video_id = vid_match.group(1) if vid_match else video_url_or_id.strip()
+        if not video_id or len(video_id) != 11:
+            return []
+
+        mix_url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+        opts = {
+            **YTDL_OPTIONS_NOCOOKIE,
+            "extract_flat": "in_playlist",
+            "playlistend": max_results,
+            "quiet": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "web_embedded", "mweb"],
+                    "player_skip": ["webpage", "configs"],
+                }
+            },
+        }
+
+        loop = asyncio.get_event_loop()
+
+        def _fetch():
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(mix_url, download=False)
+            except Exception as e:
+                logger.warning(f"Gagal mengambil YouTube Mix untuk video {video_id}: {e}")
+                return None
+
+        data = await loop.run_in_executor(None, _fetch)
+        if data and "entries" in data:
+            return [e for e in data["entries"] if e]
+        return []
+
+    @classmethod
     async def get_song(
         cls,
         query: str,
@@ -953,6 +990,7 @@ class GuildMusicQueue:
         self.is_looping: bool = False
         self.force_skip: bool = False
         self.autoplay: bool = True  # Mode AutoPlay 24/7 (default: aktif)
+        self.autoplay_mode: str = "youtube"  # 'youtube' (YouTube Mix / Up Next), 'ai' (Gemini), atau 'radio'
         self.autoplay_genre: Optional[str] = None  # Key dari GENRE_PLAYLISTS jika radio genre aktif
         self.manual_stopped: bool = False
         self.is_loading_playlist: bool = False

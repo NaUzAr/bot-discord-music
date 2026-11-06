@@ -218,18 +218,20 @@ def build_now_playing_embed(
     if song.thumbnail:
         embed.set_thumbnail(url=song.thumbnail)
 
-    # Info kurasi AI jika lagu diputar via rekomendasi AI AutoPlay
+    # Info kurasi jika lagu diputar via rekomendasi AutoPlay
     ai_ctx = getattr(song, "ai_context", None)
     if ai_ctx and isinstance(ai_ctx, dict):
         theme_str = ai_ctx.get("theme", "")
         reason_str = ai_ctx.get("reason", "")
         ai_desc = []
-        if theme_str:
+        is_yt = "YouTube" in theme_str
+        header = "▶️ Rekomendasi YouTube Autoplay" if is_yt else "🤖 Rekomendasi AI AutoPlay"
+        if theme_str and not is_yt:
             ai_desc.append(f"🏷️ **Vibe:** `{theme_str}`")
         if reason_str:
             ai_desc.append(f"💡 *\"{reason_str}\"*")
         if ai_desc:
-            embed.add_field(name="🤖 Rekomendasi AI AutoPlay", value="\n".join(ai_desc), inline=False)
+            embed.add_field(name=header, value="\n".join(ai_desc), inline=False)
 
     # Info status sederhana dalam 1 baris
     auto_status = "ON" if queue.autoplay else "OFF"
@@ -1094,9 +1096,45 @@ async def handle_autoplay(guild_id: int):
         return
 
     genre_data = GENRE_PLAYLISTS.get(queue.autoplay_genre) if queue.autoplay_genre else None
-    
-    # ─── 1. AI Context AutoPlay (Analisis Beberapa Lagu Terakhir) ───
-    if not genre_data:
+    autoplay_mode = getattr(queue, "autoplay_mode", "youtube")
+
+    # ─── 1. YouTube Native Autoplay (Up Next / YouTube Mix — Persis seperti di YouTube) ───
+    if not genre_data and autoplay_mode == "youtube" and queue.last_played:
+        last_url = getattr(queue.last_played, "webpage_url", "") or getattr(queue.last_played, "url", "")
+        try:
+            related_tracks = await YTDLSource.get_youtube_related_tracks(last_url, max_results=10)
+            for t in related_tracks:
+                t_id = t.get("id")
+                t_url = t.get("url") or (f"https://www.youtube.com/watch?v={t_id}" if t_id else None)
+                if not t_url:
+                    continue
+                # Hindari lagu yang sudah diputar atau lagu yang sama persis
+                if (
+                    t_url in queue.played_history
+                    or (t_id and any(t_id in p for p in queue.played_history))
+                    or (queue.last_played and queue.last_played.title and t.get("title") == queue.last_played.title)
+                ):
+                    continue
+
+                logger.info(f"▶️ YouTube Native Autoplay menemukan lagu: '{t.get('title')}' ({t_url})")
+                yt_song = await YTDLSource.get_song(
+                    t_url,
+                    requester=bot.user,
+                    ai_context={
+                        "theme": "YouTube Autoplay",
+                        "reason": f"Rekomendasi otomatis YouTube dari '{queue.last_played.title[:35]}'",
+                    },
+                )
+                if yt_song:
+                    queue.add(yt_song)
+                    if not vc.is_playing() and not vc.is_paused():
+                        play_next_song(guild_id)
+                    return
+        except Exception as yt_err:
+            logger.warning(f"YouTube Mix Autoplay error (fallback to search/AI): {yt_err}")
+
+    # ─── 2. AI Context AutoPlay (Analisis Beberapa Lagu Terakhir via Gemini AI) ───
+    if not genre_data and autoplay_mode == "ai":
         history_to_analyze = queue.recent_history[-5:] if queue.recent_history else ([queue.last_played] if queue.last_played else [])
         if history_to_analyze:
             try:
@@ -1105,7 +1143,6 @@ async def handle_autoplay(guild_id: int):
                     played_titles.append(queue.last_played.title)
                 ai_rec = await recommend_next_song(history_to_analyze, played_titles=played_titles)
                 if ai_rec and ai_rec.get("title") and ai_rec.get("artist"):
-                    # Buat daftar kandidat: Rekomendasi utama + alternatif cadangan
                     candidates = [ai_rec]
                     if "alternatives" in ai_rec and isinstance(ai_rec["alternatives"], list):
                         candidates.extend(ai_rec["alternatives"])
@@ -1133,7 +1170,7 @@ async def handle_autoplay(guild_id: int):
             except Exception as e:
                 logger.warning(f"AI AutoPlay context error (fallback to search): {e}")
 
-    # ─── 2. Fallback / Genre Radio AutoPlay ───
+    # ─── 3. Fallback / Genre Radio AutoPlay ───
     if genre_data:
         query = random.choice(genre_data["queries"])
         logger.info(f"📻 AutoPlay Radio [{genre_data['name']}] mencari lagu: '{query}'")
@@ -2165,13 +2202,15 @@ async def cmd_filter(interaction: discord.Interaction, jenis: Optional[app_comma
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="autoplay", description="📻 Aktifkan atau nonaktifkan AutoPlay musik otomatis 24/7")
+@bot.tree.command(name="autoplay", description="📻 Pengaturan AutoPlay musik 24/7 (YouTube / AI / Genre)")
 @app_commands.describe(
-    mode="Pilih ON untuk menyalakan atau OFF untuk mematikan",
+    mode="Pilih mode AutoPlay (YouTube Mix / AI Gemini / ON / OFF)",
     genre="Opsional: Tentukan genre lagu tertentu untuk AutoPlay 24/7",
 )
 @app_commands.choices(
     mode=[
+        app_commands.Choice(name="▶️ YouTube Autoplay (Sama seperti di YouTube)", value="youtube"),
+        app_commands.Choice(name="🤖 AI Autoplay (Rekomendasi Cerdas Gemini)", value="ai"),
         app_commands.Choice(name="ON (AutoPlay aktif)", value="on"),
         app_commands.Choice(name="OFF (AutoPlay mati)", value="off"),
     ],
@@ -2207,7 +2246,16 @@ async def cmd_autoplay(
     queue = bot.get_queue(guild_id)
 
     if mode:
-        queue.autoplay = (mode.value == "on")
+        if mode.value == "off":
+            queue.autoplay = False
+        elif mode.value == "youtube":
+            queue.autoplay = True
+            queue.autoplay_mode = "youtube"
+        elif mode.value == "ai":
+            queue.autoplay = True
+            queue.autoplay_mode = "ai"
+        elif mode.value == "on":
+            queue.autoplay = True
     elif genre is None:
         queue.autoplay = not queue.autoplay
 
@@ -2217,8 +2265,9 @@ async def cmd_autoplay(
     queue.manual_stopped = False
     genre_data = GENRE_PLAYLISTS.get(queue.autoplay_genre) if queue.autoplay_genre else None
     genre_info = f" (Genre: {genre_data['emoji']} **{genre_data['name']}**)" if genre_data else ""
+    mode_label = " [YouTube Up Next ▶️]" if getattr(queue, "autoplay_mode", "youtube") == "youtube" else " [AI Gemini 🤖]"
 
-    status_str = f"diaktifkan 📻{genre_info}" if queue.autoplay else "dinonaktifkan ⏹️"
+    status_str = f"diaktifkan 📻{mode_label}{genre_info}" if queue.autoplay else "dinonaktifkan ⏹️"
 
     vc = bot.get_guild_voice_client(guild_id)
     if queue.autoplay and vc and vc.is_connected() and not vc.is_playing() and not vc.is_paused():
