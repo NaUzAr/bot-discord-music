@@ -112,6 +112,25 @@ async def run_diagnostics():
         except Exception as e:
             log_test("Gemini AI Curation", False, str(e))
 
+    # 7. YouTube Native Mix & Anti-Loop Test
+    print(f"\n{BOLD}7. Memeriksa Fitur YouTube Mix Autoplay & Anti-Repeat...{RESET}")
+    try:
+        from music_player import YTDLSource, is_same_song, GuildMusicQueue
+        t0 = time.time()
+        related = await YTDLSource.get_youtube_related_tracks("dQw4w9WgXcQ", max_results=5)
+        rel_ms = round((time.time() - t0) * 1000, 1)
+        # Pastikan seed video disaring keluar dan minimal ditemukan lagu rekomendasi
+        seed_filtered = all(r.get("id") != "dQw4w9WgXcQ" for r in related)
+        if related and seed_filtered:
+            log_test("YouTube Mix Extraction", True, f"Ditemukan {len(related)} lagu terkait ({rel_ms} ms)")
+        else:
+            log_test("YouTube Mix Extraction", False, f"Hasil kosong atau seed tidak tersaring (found={len(related)})")
+
+        same_check = is_same_song("NF - FEAR", "NF - FEAR (Official Video)") and not is_same_song("NF - FEAR", "NF - The Search")
+        log_test("Anti-Repeat Title Matching", same_check, "Deteksi varian lagu & duplikasi akurat")
+    except Exception as e:
+        log_test("YouTube Mix & Anti-Repeat", False, str(e))
+
     print(f"\n{CYAN}------------------------------------------------------{RESET}")
     print(f"Hasil Pengujian: {BOLD}{passed_tests}/{total_tests}{RESET} tes berhasil.")
     if passed_tests == total_tests:

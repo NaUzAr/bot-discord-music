@@ -43,6 +43,7 @@ from music_player import (
     format_duration,
     is_playlist_url,
     resolve_spotify_track,
+    is_same_song,
 )
 from pomodoro import PomodoroManager
 from ai_playlist import generate_ai_playlist, recommend_next_song, CANDIDATE_MODELS
@@ -1104,128 +1105,158 @@ async def handle_autoplay(guild_id: int):
         return
     if vc.is_playing() or vc.is_paused() or queue.queue or queue.current:
         return
+    if getattr(queue, "is_handling_autoplay", False):
+        return
 
-    genre_data = GENRE_PLAYLISTS.get(queue.autoplay_genre) if queue.autoplay_genre else None
-    autoplay_mode = getattr(queue, "autoplay_mode", "youtube")
+    queue.is_handling_autoplay = True
+    try:
+        genre_data = GENRE_PLAYLISTS.get(queue.autoplay_genre) if queue.autoplay_genre else None
+        autoplay_mode = getattr(queue, "autoplay_mode", "youtube")
 
-    # ─── 1. YouTube Native Autoplay (Up Next / YouTube Mix — Persis seperti di YouTube) ───
-    if not genre_data and autoplay_mode == "youtube" and queue.last_played:
-        last_url = getattr(queue.last_played, "webpage_url", "") or getattr(queue.last_played, "url", "")
-        try:
-            related_tracks = await YTDLSource.get_youtube_related_tracks(last_url, max_results=10)
-            for t in related_tracks:
-                t_id = t.get("id")
-                t_url = t.get("url") or (f"https://www.youtube.com/watch?v={t_id}" if t_id else None)
-                if not t_url:
-                    continue
-                # Hindari lagu yang sudah diputar atau lagu yang sama persis
-                if (
-                    t_url in queue.played_history
-                    or (t_id and any(t_id in p for p in queue.played_history))
-                    or (queue.last_played and queue.last_played.title and t.get("title") == queue.last_played.title)
-                ):
-                    continue
+        # ─── 1. YouTube Native Autoplay (Up Next / YouTube Mix — Persis seperti di YouTube) ───
+        if not genre_data and autoplay_mode == "youtube" and queue.last_played:
+            last_url = getattr(queue.last_played, "webpage_url", "") or getattr(queue.last_played, "url", "")
+            seed_vid = queue.extract_video_id(last_url)
 
-                logger.info(f"▶️ YouTube Native Autoplay menemukan lagu: '{t.get('title')}' ({t_url})")
-                yt_song = await YTDLSource.get_song(
-                    t_url,
-                    requester=bot.user,
-                    ai_context={
-                        "theme": "YouTube Autoplay",
-                        "reason": f"Rekomendasi otomatis YouTube dari '{queue.last_played.title[:35]}'",
-                    },
-                )
-                if yt_song:
-                    queue.add(yt_song)
-                    if not vc.is_playing() and not vc.is_paused():
-                        play_next_song(guild_id)
-                    return
-        except Exception as yt_err:
-            logger.warning(f"YouTube Mix Autoplay error (fallback to search/AI): {yt_err}")
+            # Jika last_played bukan URL YouTube (misal SoundCloud/Spotify), cari video ID YouTube-nya dulu
+            if not seed_vid and queue.last_played.title:
+                try:
+                    sr = await YTDLSource.search_tracks(queue.last_played.title, max_results=1)
+                    if sr and sr[0].get("id"):
+                        seed_vid = sr[0]["id"]
+                except Exception:
+                    pass
 
-    # ─── 2. AI Context AutoPlay (Analisis Beberapa Lagu Terakhir via Gemini AI) ───
-    if not genre_data and autoplay_mode == "ai":
-        history_to_analyze = queue.recent_history[-5:] if queue.recent_history else ([queue.last_played] if queue.last_played else [])
-        if history_to_analyze:
-            try:
-                played_titles = [s.title for s in queue.recent_history if s and s.title]
-                if queue.last_played and queue.last_played.title:
-                    played_titles.append(queue.last_played.title)
-                ai_rec = await recommend_next_song(history_to_analyze, played_titles=played_titles)
-                if ai_rec and ai_rec.get("title") and ai_rec.get("artist"):
-                    candidates = [ai_rec]
-                    if "alternatives" in ai_rec and isinstance(ai_rec["alternatives"], list):
-                        candidates.extend(ai_rec["alternatives"])
-
-                    for cand in candidates:
-                        c_title = cand.get("title")
-                        c_artist = cand.get("artist")
-                        if not c_title or not c_artist:
+            if seed_vid:
+                try:
+                    related_tracks = await YTDLSource.get_youtube_related_tracks(seed_vid, max_results=15)
+                    for t in related_tracks:
+                        t_id = t.get("id")
+                        t_url = t.get("url") or (f"https://www.youtube.com/watch?v={t_id}" if t_id else None)
+                        t_title = t.get("title", "")
+                        if not t_url or not t_id:
                             continue
-                        search_str = f"{c_artist} {c_title}".strip()
-                        logger.info(f"🤖 AI AutoPlay mencoba rekomendasi: '{search_str}'")
-                        ai_song = await YTDLSource.get_song(
-                            search_str,
+
+                        # Hindari jika video ID sama dengan seed, atau lagu sudah pernah diputar, atau judul mirip
+                        if (
+                            t_id == seed_vid
+                            or queue.is_already_played(url=t_url, video_id=t_id, title=t_title)
+                        ):
+                            continue
+
+                        logger.info(f"▶️ YouTube Native Autoplay menemukan lagu: '{t_title}' ({t_url})")
+                        yt_song = await YTDLSource.get_song(
+                            t_url,
                             requester=bot.user,
                             ai_context={
-                                "theme": ai_rec.get("theme", "Rekomendasi AI"),
-                                "reason": ai_rec.get("reason", "Melanjutkan vibe lagu sebelumnya."),
+                                "theme": "YouTube Autoplay",
+                                "reason": f"Rekomendasi otomatis YouTube dari '{queue.last_played.title[:35]}'",
                             },
                         )
-                        if ai_song and ai_song.webpage_url not in queue.played_history:
-                            queue.add(ai_song)
+                        if yt_song:
+                            # Pastikan hasil get_song bukan lagu yang sama
+                            if queue.is_already_played(url=yt_song.webpage_url, title=yt_song.title):
+                                continue
+                            queue.add(yt_song)
                             if not vc.is_playing() and not vc.is_paused():
                                 play_next_song(guild_id)
                             return
-            except Exception as e:
-                logger.warning(f"AI AutoPlay context error (fallback to search): {e}")
+                except Exception as yt_err:
+                    logger.warning(f"YouTube Mix Autoplay error (fallback to search/AI): {yt_err}")
 
-    # ─── 3. Fallback / Genre Radio AutoPlay ───
-    if genre_data:
-        query = random.choice(genre_data["queries"])
-        logger.info(f"📻 AutoPlay Radio [{genre_data['name']}] mencari lagu: '{query}'")
-    elif queue.last_played and queue.last_played.title:
-        title = queue.last_played.title
-        clean_title = re.sub(r"[\[\(].*?[\]\)]", "", title).strip()
-        uploader = queue.last_played.uploader or ""
-        if uploader and uploader.lower() not in ["unknown artist", "youtube"]:
-            if uploader.lower() in clean_title.lower():
-                query = f"{clean_title} songs"
+        # ─── 2. AI Context AutoPlay (Analisis Beberapa Lagu Terakhir via Gemini AI) ───
+        if not genre_data and autoplay_mode == "ai":
+            history_to_analyze = queue.recent_history[-5:] if queue.recent_history else ([queue.last_played] if queue.last_played else [])
+            if history_to_analyze:
+                try:
+                    played_titles = [s.title for s in queue.recent_history if s and s.title]
+                    if queue.last_played and queue.last_played.title:
+                        played_titles.append(queue.last_played.title)
+                    ai_rec = await recommend_next_song(history_to_analyze, played_titles=played_titles)
+                    if ai_rec and ai_rec.get("title") and ai_rec.get("artist"):
+                        candidates = [ai_rec]
+                        if "alternatives" in ai_rec and isinstance(ai_rec["alternatives"], list):
+                            candidates.extend(ai_rec["alternatives"])
+
+                        for cand in candidates:
+                            c_title = cand.get("title")
+                            c_artist = cand.get("artist")
+                            if not c_title or not c_artist:
+                                continue
+                            if queue.is_already_played(title=f"{c_artist} - {c_title}"):
+                                continue
+
+                            search_str = f"{c_artist} {c_title}".strip()
+                            logger.info(f"🤖 AI AutoPlay mencoba rekomendasi: '{search_str}'")
+                            ai_song = await YTDLSource.get_song(
+                                search_str,
+                                requester=bot.user,
+                                ai_context={
+                                    "theme": ai_rec.get("theme", "Rekomendasi AI"),
+                                    "reason": ai_rec.get("reason", "Melanjutkan vibe lagu sebelumnya."),
+                                },
+                            )
+                            if ai_song and not queue.is_already_played(url=ai_song.webpage_url, title=ai_song.title):
+                                queue.add(ai_song)
+                                if not vc.is_playing() and not vc.is_paused():
+                                    play_next_song(guild_id)
+                                return
+                except Exception as e:
+                    logger.warning(f"AI AutoPlay context error (fallback to search): {e}")
+
+        # ─── 3. Fallback / Genre Radio AutoPlay ───
+        if genre_data:
+            query = random.choice(genre_data["queries"])
+            logger.info(f"📻 AutoPlay Radio [{genre_data['name']}] mencari lagu: '{query}'")
+        elif queue.last_played and queue.last_played.title:
+            title = queue.last_played.title
+            clean_title = re.sub(r"[\(\[\{].*?[\)\]\}]", "", title).strip()
+            uploader = queue.last_played.uploader or ""
+            if " - " in clean_title:
+                artist_part = clean_title.split(" - ")[0].strip()
+                query = f"{artist_part} popular songs mix"
+            elif uploader and uploader.lower() not in ["unknown artist", "youtube", "unknown"]:
+                query = f"{uploader} top hits mix"
             else:
-                query = f"{uploader} {clean_title} songs"
+                query = f"{clean_title} songs mix"
+            logger.info(f"📻 AutoPlay rekomendasi mencari lagu: '{query}'")
         else:
-            query = f"{clean_title} songs"
-        logger.info(f"📻 AutoPlay rekomendasi mencari lagu: '{query}'")
-    else:
-        query = "lofi chill beats mix"
-        logger.info(f"📻 AutoPlay default mencari lagu: '{query}'")
+            query = "top billboard hits songs playlist"
+            logger.info(f"📻 AutoPlay default mencari lagu: '{query}'")
 
-    try:
-        tracks = await YTDLSource.search_tracks(query, max_results=5)
-        selected_track = None
-        for t in tracks:
-            w_url = t.get("webpage_url") or t.get("url")
-            if w_url and w_url not in queue.played_history:
-                selected_track = t
-                break
+        try:
+            tracks = await YTDLSource.search_tracks(query, max_results=10)
+            selected_track = None
+            for t in tracks:
+                w_url = t.get("webpage_url") or t.get("url")
+                t_id = t.get("id")
+                t_title = t.get("title", "")
+                if not queue.is_already_played(url=w_url, video_id=t_id, title=t_title):
+                    selected_track = t
+                    break
 
-        if not selected_track and tracks:
-            selected_track = tracks[0]
+            if not selected_track:
+                # Jika semua lagu dari artis tsb sudah diputar, fallback ke lagu hits global
+                backup_tracks = await YTDLSource.search_tracks("top billboard hits playlist mix", max_results=10)
+                for t in backup_tracks:
+                    w_url = t.get("webpage_url") or t.get("url")
+                    t_id = t.get("id")
+                    t_title = t.get("title", "")
+                    if not queue.is_already_played(url=w_url, video_id=t_id, title=t_title):
+                        selected_track = t
+                        break
 
-        if not selected_track:
-            tracks = await YTDLSource.search_tracks("lofi hip hop radio beats to relax", max_results=3)
-            if tracks:
-                selected_track = tracks[0]
-
-        if selected_track:
-            target_url = selected_track.get("webpage_url") or selected_track.get("url")
-            song = await YTDLSource.get_song(target_url, requester=bot.user)
-            if song:
-                queue.add(song)
-                if not vc.is_playing() and not vc.is_paused():
-                    play_next_song(guild_id)
-    except Exception as e:
-        logger.error(f"Error pada handle_autoplay: {e}", exc_info=True)
+            if selected_track:
+                target_url = selected_track.get("webpage_url") or selected_track.get("url")
+                song = await YTDLSource.get_song(target_url, requester=bot.user)
+                if song and not queue.is_already_played(url=song.webpage_url, title=song.title):
+                    queue.add(song)
+                    if not vc.is_playing() and not vc.is_paused():
+                        play_next_song(guild_id)
+        except Exception as e:
+            logger.error(f"Error pada handle_autoplay: {e}", exc_info=True)
+    finally:
+        queue.is_handling_autoplay = False
 
 
 async def apply_genre_playlist(
@@ -1790,6 +1821,34 @@ async def cmd_clear(interaction: discord.Interaction):
 
     queue.queue.clear()
     await interaction.response.send_message(f"🧹 Berhasil menghapus seluruh antrean (**{count} lagu**).")
+
+
+@bot.tree.command(name="reset", description="🔄 Reset seluruh pengaturan musik (antrean, filter audio, loop, & riwayat)")
+async def cmd_reset(interaction: discord.Interaction):
+    vc = await check_same_voice_channel(interaction)
+    if not vc:
+        return
+
+    queue = bot.get_queue(interaction.guild.id)
+    if vc and (vc.is_playing() or vc.is_paused()):
+        vc.stop()
+    queue.reset()
+
+    embed = styled_embed(
+        title="🔄 Pengaturan Musik Direset",
+        description=(
+            f"{Theme.SEPARATOR_THIN}\n"
+            "Seluruh pengaturan pemutar berhasil dikembalikan ke kondisi awal:\n\n"
+            "• **Antrean & Riwayat Lagu**: Dibersihkan 🧹\n"
+            "• **Filter Audio (DSP)**: Normal / Reset ✨\n"
+            "• **Mode Looping**: Dimatikan ⏹️\n"
+            "• **AutoPlay 24/7**: Aktif (`YouTube Mix ▶️`)\n"
+            "• **Genre Radio**: Bebas (Tanpa filter genre)\n\n"
+            "💡 *Gunakan `/play` untuk memutar lagu baru!*"
+        ),
+        color=Theme.SUCCESS,
+    )
+    await interaction.response.send_message(embed=embed)
 
 
 def build_queue_embed(guild_id: int) -> discord.Embed:
@@ -4060,8 +4119,8 @@ async def cmd_help(interaction: discord.Interaction):
             "`/seek` — Loncat ke menit tertentu lagu\n"
             "`/history` — Riwayat lagu yang baru diputar\n"
             "`/filter` — Efek audio DSP (Bass, 8D, Lofi, Slowed)\n"
-            "`/skip` · `/pause` · `/resume` · `/stop`\n"
-            "`/queue` · `/nowplaying` · `/volume` · `/loop`\n"
+            "`/skip` · `/pause` · `/resume` · `/stop` · `/reset`\n"
+            "`/queue` · `/nowplaying` · `/volume` · `/loop` · `/clear`\n"
             "`/autoplay` · `/radio` · `/genre` (24/7)"
         ),
         inline=True,

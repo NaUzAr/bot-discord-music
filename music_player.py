@@ -527,7 +527,7 @@ class YTDLSource:
         return entries
 
     @classmethod
-    async def get_youtube_related_tracks(cls, video_url_or_id: str, max_results: int = 10) -> List[dict]:
+    async def get_youtube_related_tracks(cls, video_url_or_id: str, max_results: int = 15) -> List[dict]:
         """Mengambil daftar lagu Up Next / YouTube Mix (RD Playlist) persis seperti fitur Autoplay di YouTube."""
         vid_match = re.search(r"(?:v=|\/|be\/)([a-zA-Z0-9_-]{11})", video_url_or_id)
         video_id = vid_match.group(1) if vid_match else video_url_or_id.strip()
@@ -537,15 +537,10 @@ class YTDLSource:
         mix_url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
         opts = {
             **YTDL_OPTIONS_NOCOOKIE,
+            "noplaylist": False,
             "extract_flat": "in_playlist",
-            "playlistend": max_results,
+            "playlistend": max_results + 5,
             "quiet": True,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "web_embedded", "mweb"],
-                    "player_skip": ["webpage", "configs"],
-                }
-            },
         }
 
         loop = asyncio.get_event_loop()
@@ -560,7 +555,21 @@ class YTDLSource:
 
         data = await loop.run_in_executor(None, _fetch)
         if data and "entries" in data:
-            return [e for e in data["entries"] if e]
+            results = []
+            for e in data["entries"]:
+                if not e:
+                    continue
+                e_id = e.get("id")
+                # Filter out the seed video itself (Entry 0 of YouTube Mix)
+                if e_id and e_id == video_id:
+                    continue
+                e_title = e.get("title")
+                if not e_title or e_title in ["[Private video]", "[Deleted video]"]:
+                    continue
+                if not e.get("url") and e_id:
+                    e["url"] = f"https://www.youtube.com/watch?v={e_id}"
+                results.append(e)
+            return results[:max_results]
         return []
 
     @classmethod
@@ -980,6 +989,40 @@ def create_audio_source(
         )
 
 
+def get_title_tokens(title: str) -> set:
+    """Mengambil set token esensial dari judul lagu untuk deteksi duplikat."""
+    if not title:
+        return set()
+    cleaned = re.sub(
+        r"[\(\[\{].*?(?:official|video|audio|lyric|lirik|clip|mv|visualizer|remaster|hd|4k|hq).*?[\)\]\}]",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[\(\[\{].*?[\)\]\}]", "", cleaned)
+    cleaned = re.sub(
+        r"\b(official|video|audio|lyrics?|lyric|clip|visualizer|remastered?|songs?|feat|ft|featuring)\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", cleaned).lower()
+    return set(cleaned.split())
+
+
+def is_same_song(title1: str, title2: str) -> bool:
+    """Mengecek apakah dua judul lagu merujuk pada lagu yang sama (misal judul asli vs video lirik/remaster)."""
+    if not title1 or not title2:
+        return False
+    toks1 = get_title_tokens(title1)
+    toks2 = get_title_tokens(title2)
+    if not toks1 or not toks2:
+        return False
+    inter = toks1 & toks2
+    min_len = min(len(toks1), len(toks2))
+    return (len(inter) / min_len) >= 0.7
+
+
 class GuildMusicQueue:
     """Menangani antrean musik per Discord Server."""
 
@@ -995,8 +1038,11 @@ class GuildMusicQueue:
         self.manual_stopped: bool = False
         self.is_loading_playlist: bool = False
         self.last_played: Optional[Song] = None
-        self.recent_history: List[Song] = []  # Menyimpan hingga 6 lagu terakhir untuk analisis tema AI AutoPlay
+        self.recent_history: List[Song] = []  # Menyimpan hingga 20 lagu terakhir untuk analisis tema AI AutoPlay
         self.played_history: Set[str] = set()
+        self.played_video_ids: Set[str] = set()
+        self.played_titles: List[str] = []
+        self.is_handling_autoplay: bool = False
         self.volume: float = 1.0  # 100%
         self.text_channel: Optional[discord.TextChannel] = None
         # Audio filter state & timing tracking
@@ -1005,6 +1051,42 @@ class GuildMusicQueue:
         self.pause_start_time: float = 0.0
         self.paused_duration: float = 0.0
         self.is_reloading: bool = False
+
+    @staticmethod
+    def extract_video_id(url_or_id: Optional[str]) -> Optional[str]:
+        if not url_or_id:
+            return None
+        m = re.search(r"(?:v=|\/|be\/)([a-zA-Z0-9_-]{11})", url_or_id)
+        if m:
+            return m.group(1)
+        cleaned = url_or_id.strip()
+        if len(cleaned) == 11 and re.match(r"^[a-zA-Z0-9_-]{11}$", cleaned):
+            return cleaned
+        return None
+
+    def is_already_played(
+        self,
+        url: Optional[str] = None,
+        video_id: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> bool:
+        """Mengecek apakah lagu sudah pernah diputar berdasarkan URL, YouTube Video ID, atau kemiripan judul."""
+        vid = video_id or (self.extract_video_id(url) if url else None)
+        if vid and vid in self.played_video_ids:
+            return True
+
+        if url and url in self.played_history:
+            return True
+
+        if title:
+            if self.last_played and self.last_played.title:
+                if is_same_song(title, self.last_played.title):
+                    return True
+            for past_title in reversed(self.played_titles[-25:]):
+                if is_same_song(title, past_title):
+                    return True
+
+        return False
 
     def get_elapsed_seconds(self) -> float:
         """Menghitung detik pemutaran lagu saat ini."""
@@ -1030,15 +1112,34 @@ class GuildMusicQueue:
             self.recent_history.append(self.current)
             if len(self.recent_history) > 20:
                 self.recent_history.pop(0)
+
+            # Catat riwayat URL
             if self.current.webpage_url:
                 self.played_history.add(self.current.webpage_url)
-                # Cap played_history agar tidak memakan memori di mode 24/7
-                if len(self.played_history) > 200:
-                    # Hapus setengah entry terlama (set tidak ordered, tapi efek rotasinya tetap terasa)
-                    evict_count = len(self.played_history) - 100
-                    evict_items = list(self.played_history)[:evict_count]
-                    for item in evict_items:
-                        self.played_history.discard(item)
+            if self.current.url:
+                self.played_history.add(self.current.url)
+
+            # Catat video ID YouTube
+            vid = self.extract_video_id(self.current.webpage_url or self.current.url or "")
+            if vid:
+                self.played_video_ids.add(vid)
+
+            # Catat judul lagu untuk pencegahan pemutaran berulang
+            if self.current.title:
+                self.played_titles.append(self.current.title)
+                if len(self.played_titles) > 50:
+                    self.played_titles.pop(0)
+
+            # Cap played_history dan played_video_ids agar hemat memori di mode 24/7
+            if len(self.played_history) > 200:
+                evict_count = len(self.played_history) - 100
+                evict_items = list(self.played_history)[:evict_count]
+                for item in evict_items:
+                    self.played_history.discard(item)
+            if len(self.played_video_ids) > 200:
+                evict_v = list(self.played_video_ids)[:100]
+                for item in evict_v:
+                    self.played_video_ids.discard(item)
 
         if self.queue:
             self.current = self.queue.pop(0)
@@ -1055,6 +1156,20 @@ class GuildMusicQueue:
         self.paused_duration = 0.0
         self.is_reloading = False
         self.is_loading_playlist = False
+
+    def reset(self):
+        """Mereset seluruh antrean, filter, riwayat, dan mode autoplay ke pengaturan awal."""
+        self.clear()
+        self.audio_filter = None
+        self.is_looping = False
+        self.autoplay_genre = None
+        self.autoplay_mode = "youtube"
+        self.autoplay = True
+        self.played_history.clear()
+        self.played_video_ids.clear()
+        self.played_titles.clear()
+        self.recent_history.clear()
+        self.last_played = None
 
 
 class SearchSelectView(ui.View):
