@@ -331,14 +331,16 @@ class RythmVoiceBot(discord.Client):
                     self.target_channels[guild.id] = guild.voice_client.channel.id
                 logger.info(f"🔊 Sinkronisasi voice client yang sudah aktif: '{guild.voice_client.channel.name}' di '{guild.name}'")
 
-        # Bersihkan duplikasi guild-specific commands jika pernah disinkronkan via /sync atau !sync
+        # Bersihkan duplikasi guild commands jika pernah ada yang tersimpan di server
         for guild in self.guilds:
             try:
-                self.tree.clear_commands(guild=guild)
-                await self.tree.sync(guild=guild)
-                logger.info(f"🧹 Berhasil membersihkan duplikasi slash commands di server '{guild.name}' ({guild.id})")
+                guild_cmds = await self.tree.fetch_commands(guild=guild)
+                if guild_cmds:
+                    self.tree.clear_commands(guild=guild)
+                    await self.tree.sync(guild=guild)
+                    logger.info(f"🧹 Berhasil membersihkan {len(guild_cmds)} duplikasi guild commands di '{guild.name}'")
             except Exception as e:
-                logger.warning(f"Gagal membersihkan guild commands di '{guild.name}': {e}")
+                logger.debug(f"Pengecekan guild commands di '{guild.name}': {e}")
 
         logger.info(f"⚡ Global commands aktif di {len(self.guilds)} server.")
 
