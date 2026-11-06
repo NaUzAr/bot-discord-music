@@ -331,8 +331,15 @@ class RythmVoiceBot(discord.Client):
                     self.target_channels[guild.id] = guild.voice_client.channel.id
                 logger.info(f"🔊 Sinkronisasi voice client yang sudah aktif: '{guild.voice_client.channel.name}' di '{guild.name}'")
 
-        # Slash commands sudah di-sync secara global di setup_hook() tanpa duplikasi
-        # Jika butuh sinkronisasi instan per server, admin dapat menggunakan perintah /sync
+        # Bersihkan duplikasi guild-specific commands jika pernah disinkronkan via /sync atau !sync
+        for guild in self.guilds:
+            try:
+                self.tree.clear_commands(guild=guild)
+                await self.tree.sync(guild=guild)
+                logger.info(f"🧹 Berhasil membersihkan duplikasi slash commands di server '{guild.name}' ({guild.id})")
+            except Exception as e:
+                logger.warning(f"Gagal membersihkan guild commands di '{guild.name}': {e}")
+
         logger.info(f"⚡ Global commands aktif di {len(self.guilds)} server.")
 
         # Mulai background tasks
@@ -388,14 +395,15 @@ class RythmVoiceBot(discord.Client):
         content = message.content.strip()
         lower_content = content.lower()
 
-        # Command !sync: sinkronkan slash command ke server saat ini secara instan
-        if lower_content == "!sync":
+        # Command !sync: bersihkan duplikasi guild commands dan sinkronkan global commands
+        if lower_content in ["!sync", "!clearsync"]:
             try:
-                self.tree.copy_global_to(guild=message.guild)
-                synced = await self.tree.sync(guild=message.guild)
+                self.tree.clear_commands(guild=message.guild)
+                await self.tree.sync(guild=message.guild)
+                synced = await self.tree.sync()
                 await message.reply(
-                    f"⚡ **Berhasil menyinkronkan {len(synced)} slash commands ke server ini secara instan!**\n"
-                    f"Sekarang autocomplete `/sleep`, `/play`, dll. sudah langsung aktif."
+                    f"⚡ **Berhasil membersihkan duplikasi slash commands dan menyinkronkan {len(synced)} commands!**\n"
+                    f"Jika di Discord masih terlihat dobel, tekan `Ctrl + R` (Discord Desktop) untuk refresh tampilan."
                 )
             except Exception as e:
                 await message.reply(f"❌ Gagal sinkronisasi: `{e}`")
@@ -3799,18 +3807,22 @@ async def cmd_sleeptimer_status(interaction: discord.Interaction):
     await _execute_sleeptimer_status(interaction)
 
 
-@bot.tree.command(name="sync", description="⚡ Sinkronisasi ulang semua slash commands ke server ini secara instan")
+@bot.tree.command(name="sync", description="⚡ Sinkronisasi ulang & bersihkan duplikasi slash commands")
 async def cmd_sync(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("❌ Hanya dapat digunakan di dalam server.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     try:
-        bot.tree.copy_global_to(guild=interaction.guild)
-        synced = await bot.tree.sync(guild=interaction.guild)
+        # 1. Hapus guild-specific commands agar tidak duplikat dengan global commands
+        bot.tree.clear_commands(guild=interaction.guild)
+        await bot.tree.sync(guild=interaction.guild)
+
+        # 2. Sinkronkan global commands
+        synced = await bot.tree.sync()
         await interaction.followup.send(
-            f"⚡ **Berhasil menyinkronkan {len(synced)} slash commands ke server ini!**\n"
-            f"Ketik `/sleep` atau `/play` sekarang — autocomplete sudah langsung aktif.",
+            f"⚡ **Berhasil membersihkan duplikasi slash commands dan menyinkronkan {len(synced)} commands!**\n"
+            f"Jika di aplikasi Discord masih terlihat dobel, tekan `Ctrl + R` (Discord Desktop) atau restart aplikasi Discord untuk refresh cache.",
             ephemeral=True,
         )
     except Exception as e:
