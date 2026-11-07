@@ -346,6 +346,39 @@ class RythmVoiceBot(discord.Client):
 
         logger.info(f"⚡ Global commands aktif di {len(self.guilds)} server.")
 
+        # Muat target 24/7 channels dari database SQLite agar otomatis terhubung setelah restart
+        try:
+            saved_247 = await database.get_all_247_channels()
+            for gid, cid in saved_247.items():
+                self.target_channels[gid] = cid
+                logger.info(f"💾 Memuat saved 24/7 channel: {cid} untuk Guild {gid}")
+        except Exception as e:
+            logger.warning(f"Gagal memuat saved 24/7 channels: {e}")
+
+        # Otomatis join ke voice channel 24/7 yang tersimpan jika belum terkoneksi
+        for gid, cid in list(self.target_channels.items()):
+            guild = self.get_guild(gid)
+            if guild and not guild.voice_client:
+                channel = guild.get_channel(cid)
+                if not channel:
+                    try:
+                        channel = await self.fetch_channel(cid)
+                    except Exception:
+                        channel = None
+                if channel:
+                    try:
+                        logger.info(f"🎙️ Auto-joining saved 24/7 channel '{channel.name}' di '{guild.name}'...")
+                        vc = await channel.connect(self_deaf=False, timeout=20.0)
+                        self.voice_clients_dict[gid] = vc
+                        self.connected_since[gid] = datetime.now(timezone.utc)
+                        self.reconnect_attempts[gid] = 0
+                        logger.info(f"✅ Berhasil terhubung ke 24/7 channel '{channel.name}' di '{guild.name}'")
+                        queue = self.get_queue(gid)
+                        if queue.autoplay and not queue.manual_stopped and not queue.queue:
+                            asyncio.create_task(handle_autoplay(gid))
+                    except Exception as e:
+                        logger.warning(f"Gagal auto-connect ke 24/7 channel '{channel.name}': {e}")
+
         # Mulai background tasks
         if not self.reconnect_loop.is_running():
             self.reconnect_loop.start()
@@ -384,6 +417,7 @@ class RythmVoiceBot(discord.Client):
                 # Bot dipindahkan atau baru bergabung ke channel
                 self.target_channels[guild_id] = after.channel.id
                 self.reconnect_attempts[guild_id] = 0
+                asyncio.create_task(database.save_247_channel(guild_id, after.channel.id))
                 if member.guild.voice_client:
                     self.voice_clients_dict[guild_id] = member.guild.voice_client
             return
@@ -586,7 +620,13 @@ class RythmVoiceBot(discord.Client):
 
             channel = guild.get_channel(channel_id)
             if not channel:
+                try:
+                    channel = await self.fetch_channel(channel_id)
+                except Exception:
+                    channel = None
+            if not channel:
                 self.target_channels.pop(guild_id, None)
+                asyncio.create_task(database.remove_247_channel(guild_id))
                 continue
 
             # Circuit breaker: hentikan reconnect loop jika 3x berturut-turut gagal
@@ -1406,6 +1446,7 @@ async def ensure_voice_connection(interaction: discord.Interaction) -> Optional[
             bot.target_channels[guild_id] = user_channel.id
             bot.connected_since[guild_id] = datetime.now(timezone.utc)
             bot.reconnect_attempts[guild_id] = 0
+            asyncio.create_task(database.save_247_channel(guild_id, user_channel.id))
         except discord.ClientException as e:
             # Antisipasi race condition: jika discord menganggap bot sudah terkoneksi
             if "already connected" in str(e).lower() and guild.voice_client:
@@ -1413,6 +1454,7 @@ async def ensure_voice_connection(interaction: discord.Interaction) -> Optional[
                 bot.voice_clients_dict[guild_id] = vc
                 bot.target_channels[guild_id] = user_channel.id
                 bot.reconnect_attempts[guild_id] = 0
+                asyncio.create_task(database.save_247_channel(guild_id, user_channel.id))
                 if guild_id not in bot.connected_since:
                     bot.connected_since[guild_id] = datetime.now(timezone.utc)
                 if vc.channel and vc.channel.id != user_channel.id:
@@ -4034,11 +4076,12 @@ async def cmd_leave(interaction: discord.Interaction):
 
     guild_id = interaction.guild.id
 
-    # Hapus dari auto-reconnect tracking
+    # Hapus dari auto-reconnect tracking & database 24/7
     bot.target_channels.pop(guild_id, None)
     bot.connected_since.pop(guild_id, None)
     bot.voice_clients_dict.pop(guild_id, None)
     bot.reconnect_attempts.pop(guild_id, None)
+    asyncio.create_task(database.remove_247_channel(guild_id))
 
     # Stop pomodoro & musik jika ada
     bot.pomodoro.stop_session(guild_id)

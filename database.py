@@ -56,6 +56,14 @@ async def init_db():
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS voice_247 (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL
+            )
+            """
+        )
         await db.commit()
     logger.info("📦 SQLite database initialized (async).")
 
@@ -305,3 +313,40 @@ async def delete_playlist(user_id: int, guild_id: int, name: str) -> bool:
     except Exception as e:
         logger.error(f"Gagal menghapus playlist '{name}': {e}")
         return False
+
+
+# ─── 24/7 Voice Channel Persistent Settings ──────────────────────────
+async def save_247_channel(guild_id: int, channel_id: int):
+    """Menyimpan voice channel target untuk 24/7 stay di SQLite."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO voice_247 (guild_id, channel_id) VALUES (?, ?)",
+                (guild_id, channel_id),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Gagal menyimpan 24/7 voice channel: {e}")
+
+
+async def remove_247_channel(guild_id: int):
+    """Menghapus setting 24/7 stay untuk guild ini."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM voice_247 WHERE guild_id = ?", (guild_id,))
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Gagal menghapus 24/7 voice channel: {e}")
+
+
+async def get_all_247_channels() -> Dict[int, int]:
+    """Mengambil semua voice channel target 24/7 yang tersimpan."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT guild_id, channel_id FROM voice_247") as cursor:
+                rows = await cursor.fetchall()
+                return {row[0]: row[1] for row in rows}
+    except Exception as e:
+        logger.error(f"Gagal memuat 24/7 voice channels: {e}")
+        return {}
+
