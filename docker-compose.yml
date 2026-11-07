@@ -10,9 +10,9 @@ services:
     environment:
       - PORT=8080
       - DB_PATH=/app/data/voice_tracker.db
-    # Ports ditutup demi keamanan (Bot Discord tidak membutuhkan port masuk / inbound)
-    # ports:
-    #   - "127.0.0.1:8088:8080"
+    # Web Dashboard & Healthcheck port (http://IP_VPS:8088/)
+    ports:
+      - "8088:8080"
     volumes:
       # Penyimpanan data persisten untuk SQLite database & playlist
       - ./data:/app/data

@@ -2,11 +2,13 @@
 🌐 Web Dashboard & Healthcheck Endpoint
 - Menggunakan aiohttp.web (ringan & terintegrasi langsung dengan event loop asyncio bot)
 - Menyediakan endpoint healthcheck /health untuk cloud deployment (Docker, VPS, Railway, Render)
-- Menyediakan UI Dashboard Web modern bertema dark-glassmorphism untuk memantau status bot real-time
+- Menyediakan endpoint /api/stats untuk polling data real-time
+- Menyediakan UI Dashboard Web modern bertema dark-glassmorphism dengan live auto-update dan audio visualizer
 """
 
 import os
 import time
+import html
 import logging
 from aiohttp import web
 from typing import TYPE_CHECKING
@@ -22,77 +24,126 @@ START_TIME = time.time()
 def create_dashboard_app(bot) -> web.Application:
     app = web.Application()
 
-    async def handle_health(request):
-        uptime_sec = int(time.time() - START_TIME)
-        playing_count = sum(
-            1 for q in bot.music_queues.values() if q.current is not None
-        )
-        data = {
-            "status": "healthy",
-            "bot_user": str(bot.user) if bot.user else "Offline",
-            "uptime_seconds": uptime_sec,
-            "latency_ms": round(bot.latency * 1000, 1) if bot.latency else 0,
-            "guild_count": len(bot.guilds),
-            "voice_connections": len(bot.voice_clients_dict),
-            "playing_servers": playing_count,
-        }
-        return web.json_response(data)
-
-    async def handle_dashboard(request):
+    def get_stats_data():
         uptime_sec = int(time.time() - START_TIME)
         hours = uptime_sec // 3600
         minutes = (uptime_sec % 3600) // 60
         seconds = uptime_sec % 60
         uptime_str = f"{hours}h {minutes}m {seconds}s"
 
-        ping = round(bot.latency * 1000, 1) if bot.latency else 0
+        ping = round(bot.latency * 1000, 1) if (bot.latency is not None and bot.latency > 0) else 0
         guilds_count = len(bot.guilds)
-        voice_count = len(bot.voice_clients_dict)
+        voice_count = sum(1 for vc in bot.voice_clients_dict.values() if vc and vc.is_connected())
 
-        # Collect currently playing songs
-        playing_cards = []
+        playing_tracks = []
         for gid, q in bot.music_queues.items():
             if q.current:
                 guild = bot.get_guild(gid)
                 gname = guild.name if guild else f"Server #{gid}"
                 elapsed = int(q.get_elapsed_seconds())
                 elapsed_min, elapsed_sec = divmod(elapsed, 60)
-                elapsed_str = f"{elapsed_min:02d}:{elapsed_sec:02d}"
-                dur_str = q.current.duration_str or "Live"
-                title = q.current.title[:45] + ("…" if len(q.current.title) > 45 else "")
-                uploader = q.current.uploader or "Unknown Artist"
-                thumb = q.current.thumbnail or "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=300"
-                
-                pct = 0
-                if q.current.duration and q.current.duration > 0:
-                    pct = min(100, int((elapsed / q.current.duration) * 100))
+                dur_sec = q.current.duration or 0
+                pct = min(100, int((elapsed / dur_sec) * 100)) if dur_sec > 0 else 0
 
-                playing_cards.append(f"""
-                <div class="card">
+                playing_tracks.append({
+                    "guild_id": gid,
+                    "guild_name": gname,
+                    "title": q.current.title,
+                    "uploader": q.current.uploader or "Unknown Artist",
+                    "thumbnail": q.current.thumbnail or "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=300",
+                    "elapsed_str": f"{elapsed_min:02d}:{elapsed_sec:02d}",
+                    "duration_str": q.current.duration_str or "Live",
+                    "progress_pct": pct,
+                    "queue_count": len(q.queue),
+                    "autoplay": bool(q.autoplay),
+                })
+
+        return {
+            "status": "healthy",
+            "bot_user": str(bot.user) if bot.user else "Rythm Companion",
+            "uptime_seconds": uptime_sec,
+            "uptime_str": uptime_str,
+            "latency_ms": ping,
+            "guild_count": guilds_count,
+            "voice_connections": voice_count,
+            "playing_servers": len(playing_tracks),
+            "tracks": playing_tracks,
+        }
+
+    async def handle_health(request):
+        data = get_stats_data()
+        return web.json_response({
+            "status": data["status"],
+            "bot_user": data["bot_user"],
+            "uptime_seconds": data["uptime_seconds"],
+            "latency_ms": data["latency_ms"],
+            "guild_count": data["guild_count"],
+            "voice_connections": data["voice_connections"],
+            "playing_servers": data["playing_servers"],
+        })
+
+    async def handle_api_stats(request):
+        data = get_stats_data()
+        return web.json_response(data)
+
+    async def handle_dashboard(request):
+        data = get_stats_data()
+        uptime_str = data["uptime_str"]
+        ping = data["latency_ms"]
+        guilds_count = data["guild_count"]
+        voice_count = data["voice_connections"]
+        bot_user = html.escape(data["bot_user"])
+
+        playing_cards = []
+        for track in data["tracks"]:
+            gname = html.escape(track["guild_name"])
+            title = html.escape(track["title"][:45] + ("…" if len(track["title"]) > 45 else ""))
+            uploader = html.escape(track["uploader"])
+            thumb = html.escape(track["thumbnail"])
+            elapsed_str = track["elapsed_str"]
+            dur_str = track["duration_str"]
+            pct = track["progress_pct"]
+            q_info = f"<span class='badge-queue'>+ {track['queue_count']} di antrean</span>" if track["queue_count"] > 0 else ""
+            ap_info = "<span class='badge-ap'>📻 AutoPlay 24/7</span>" if track["autoplay"] else ""
+
+            playing_cards.append(f"""
+            <div class="card" id="card-{track['guild_id']}">
+                <div class="thumb-container">
                     <img src="{thumb}" alt="Thumbnail" class="card-thumb" onerror="this.src='https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=300'">
-                    <div class="card-info">
-                        <span class="badge-guild">📍 {gname}</span>
-                        <div class="track-title">{title}</div>
-                        <div class="track-artist">👤 {uploader}</div>
-                        <div class="progress-bar-bg">
-                            <div class="progress-bar-fill" style="width: {pct}%"></div>
-                        </div>
-                        <div class="track-time"><span>{elapsed_str}</span><span>{dur_str}</span></div>
+                    <div class="equalizer">
+                        <span class="bar bar-1"></span>
+                        <span class="bar bar-2"></span>
+                        <span class="bar bar-3"></span>
+                        <span class="bar bar-4"></span>
                     </div>
                 </div>
-                """)
+                <div class="card-info">
+                    <div class="badge-row">
+                        <span class="badge-guild">📍 {gname}</span>
+                        {ap_info}
+                        {q_info}
+                    </div>
+                    <div class="track-title" title="{html.escape(track['title'])}">{title}</div>
+                    <div class="track-artist">👤 {uploader}</div>
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" style="width: {pct}%"></div>
+                    </div>
+                    <div class="track-time"><span>{elapsed_str}</span><span>{dur_str}</span></div>
+                </div>
+            </div>
+            """)
 
         if not playing_cards:
-            playing_html = """<div class="empty-state">💤 Saat ini tidak ada lagu yang sedang diputar. Gunakan <code>/play</code> di Discord untuk memulai!</div>"""
+            playing_html = """<div class="empty-state">💤 Saat ini tidak ada lagu yang sedang diputar.<br><span style="font-size:0.85rem; opacity:0.7">Gunakan <code>/play</code> atau <code>/radio</code> di Discord untuk memulai musik 24/7!</span></div>"""
         else:
             playing_html = "".join(playing_cards)
 
-        html = f"""<!DOCTYPE html>
+        html_content = f"""<!DOCTYPE html>
 <html lang="id">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🎵 Rythm & Voice Companion — Live Dashboard</title>
+    <title>🎵 {bot_user} — Live 24/7 Dashboard</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
     <style>
         :root {{
@@ -141,7 +192,7 @@ def create_dashboard_app(bot) -> web.Application:
             display: inline-flex; align-items: center; gap: 8px;
             background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3);
             color: var(--accent-green); padding: 8px 16px; border-radius: 999px;
-            font-size: 0.85rem; font-weight: 600;
+            font-size: 0.85rem; font-weight: 600; transition: all 0.3s ease;
         }}
         .dot {{ width: 8px; height: 8px; background: var(--accent-green); border-radius: 50%; box-shadow: 0 0 10px var(--accent-green); animation: pulse 2s infinite; }}
         @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} }}
@@ -161,24 +212,59 @@ def create_dashboard_app(bot) -> web.Application:
 
         .section-header {{
             font-size: 1.25rem; font-weight: 700; margin-bottom: 20px;
-            display: flex; align-items: center; gap: 10px;
+            display: flex; align-items: center; justify-content: space-between;
         }}
-        .cards-list {{ display: flex; flex-direction: column; gap: 16px; }}
+        .live-indicator {{
+            font-size: 0.75rem; color: var(--accent-cyan);
+            font-family: 'JetBrains Mono', monospace;
+            display: flex; align-items: center; gap: 6px;
+        }}
+        .cards-list {{ display: flex; flex-direction: column; gap: 16px; min-height: 120px; }}
         .card {{
             background: var(--surface-color); backdrop-filter: blur(12px);
             border: 1px solid var(--surface-border); border-radius: 18px;
             padding: 16px; display: flex; gap: 20px; align-items: center;
+            animation: fadeIn 0.4s ease;
+        }}
+        @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(6px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+
+        .thumb-container {{
+            position: relative; width: 100px; height: 100px; flex-shrink: 0;
         }}
         .card-thumb {{
-            width: 100px; height: 100px; border-radius: 14px; object-fit: cover;
+            width: 100%; height: 100%; border-radius: 14px; object-fit: cover;
             box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
         }}
-        .card-info {{ flex: 1; }}
-        .badge-guild {{
-            display: inline-block; font-size: 0.75rem; background: rgba(255, 255, 255, 0.08);
-            padding: 4px 10px; border-radius: 6px; color: var(--accent-cyan); margin-bottom: 6px;
+        .equalizer {{
+            position: absolute; bottom: 8px; right: 8px;
+            display: flex; align-items: flex-end; gap: 3px; height: 16px;
+            background: rgba(0, 0, 0, 0.6); padding: 3px 5px; border-radius: 6px;
         }}
-        .track-title {{ font-size: 1.1rem; font-weight: 700; margin-bottom: 4px; }}
+        .bar {{ width: 3px; background: var(--accent-cyan); border-radius: 2px; animation: eq 1.2s infinite ease-in-out; }}
+        .bar-1 {{ height: 40%; animation-delay: 0.1s; }}
+        .bar-2 {{ height: 90%; animation-delay: 0.3s; }}
+        .bar-3 {{ height: 60%; animation-delay: 0.2s; }}
+        .bar-4 {{ height: 80%; animation-delay: 0.4s; }}
+        @keyframes eq {{ 0%, 100% {{ height: 25%; }} 50% {{ height: 100%; }} }}
+
+        .card-info {{ flex: 1; min-width: 0; }}
+        .badge-row {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }}
+        .badge-guild {{
+            font-size: 0.75rem; background: rgba(255, 255, 255, 0.08);
+            padding: 4px 10px; border-radius: 6px; color: var(--accent-cyan); font-weight: 600;
+        }}
+        .badge-ap {{
+            font-size: 0.75rem; background: rgba(121, 80, 242, 0.2);
+            padding: 4px 10px; border-radius: 6px; color: #a78bfa; font-weight: 600;
+        }}
+        .badge-queue {{
+            font-size: 0.75rem; background: rgba(16, 185, 129, 0.2);
+            padding: 4px 10px; border-radius: 6px; color: #34d399; font-weight: 600;
+        }}
+        .track-title {{
+            font-size: 1.1rem; font-weight: 700; margin-bottom: 4px;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }}
         .track-artist {{ font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 12px; }}
         .progress-bar-bg {{
             background: rgba(255, 255, 255, 0.1); border-radius: 999px; height: 6px;
@@ -186,7 +272,7 @@ def create_dashboard_app(bot) -> web.Application:
         }}
         .progress-bar-fill {{
             background: linear-gradient(90deg, var(--accent-purple), var(--accent-cyan));
-            height: 100%; border-radius: 999px; transition: width 0.5s ease;
+            height: 100%; border-radius: 999px; transition: width 0.8s ease;
         }}
         .track-time {{
             display: flex; justify-content: space-between; font-size: 0.75rem;
@@ -195,6 +281,7 @@ def create_dashboard_app(bot) -> web.Application:
         .empty-state {{
             background: var(--surface-color); border: 1px dashed var(--surface-border);
             border-radius: 18px; padding: 40px; text-align: center; color: var(--text-secondary);
+            line-height: 1.6;
         }}
         footer {{
             margin-top: auto; padding-top: 40px; text-align: center;
@@ -213,51 +300,142 @@ def create_dashboard_app(bot) -> web.Application:
                 <div class="bot-avatar">🎵</div>
                 <div>
                     <div class="brand-title">Rythm & Voice Companion</div>
-                    <div class="brand-subtitle">Discord Music, AI DJ & Pomodoro System</div>
+                    <div class="brand-subtitle">Discord Music 24/7 · AI DJ · Voice Activity Tracker</div>
                 </div>
             </div>
-            <div class="status-pill">
+            <div class="status-pill" id="statusPill">
                 <div class="dot"></div>
-                SYSTEM ONLINE
+                <span id="statusText">SYSTEM ONLINE 24/7</span>
             </div>
         </header>
 
         <div class="stats-grid">
             <div class="stat-card">
                 <div class="stat-label">⏱️ Uptime</div>
-                <div class="stat-value">{uptime_str}</div>
+                <div class="stat-value" id="valUptime">{uptime_str}</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">📶 Latency</div>
-                <div class="stat-value" style="color: var(--accent-cyan);">{ping} ms</div>
+                <div class="stat-label">📶 Latency (Ping)</div>
+                <div class="stat-value" id="valPing" style="color: var(--accent-cyan);">{ping} ms</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">🌐 Server Terhubung</div>
-                <div class="stat-value">{guilds_count}</div>
+                <div class="stat-value" id="valGuilds">{guilds_count}</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">🔊 Voice Room Aktif</div>
-                <div class="stat-value" style="color: var(--accent-purple);">{voice_count}</div>
+                <div class="stat-value" id="valVoice" style="color: var(--accent-purple);">{voice_count}</div>
             </div>
         </div>
 
         <div class="section-header">
             <span>🎶 Sedang Diputar Saat Ini (Now Playing)</span>
+            <span class="live-indicator"><span class="dot" style="width:6px;height:6px;"></span> LIVE AUTO-SYNC (3s)</span>
         </div>
-        <div class="cards-list">
+        <div class="cards-list" id="cardsList">
             {playing_html}
         </div>
 
         <footer>
-            Built for Discord Music & Voice Competition • Powered by discord.py & Google Gemini AI
+            Built for Discord Music & 24/7 Voice Companion • Powered by discord.py & Google Gemini AI
         </footer>
     </div>
+
+    <script>
+        function escapeHtml(str) {{
+            if (!str) return '';
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }}
+
+        async function updateDashboard() {{
+            try {{
+                const res = await fetch('/api/stats');
+                if (!res.ok) throw new Error('Network error');
+                const data = await res.json();
+
+                // 1. Update status pill
+                const pill = document.getElementById('statusPill');
+                const statusText = document.getElementById('statusText');
+                pill.style.background = 'rgba(16, 185, 129, 0.15)';
+                pill.style.borderColor = 'rgba(16, 185, 129, 0.3)';
+                pill.style.color = 'var(--accent-green)';
+                statusText.textContent = 'SYSTEM ONLINE 24/7';
+
+                // 2. Update stat cards
+                document.getElementById('valUptime').textContent = data.uptime_str;
+                const pingEl = document.getElementById('valPing');
+                pingEl.textContent = data.latency_ms + ' ms';
+                pingEl.style.color = data.latency_ms < 120 ? 'var(--accent-cyan)' : (data.latency_ms < 250 ? '#facc15' : 'var(--accent-pink)');
+                document.getElementById('valGuilds').textContent = data.guild_count;
+                document.getElementById('valVoice').textContent = data.voice_connections;
+
+                // 3. Update Now Playing cards
+                const container = document.getElementById('cardsList');
+                if (!data.tracks || data.tracks.length === 0) {{
+                    container.innerHTML = '<div class="empty-state">💤 Saat ini tidak ada lagu yang sedang diputar.<br><span style="font-size:0.85rem; opacity:0.7">Gunakan <code>/play</code> atau <code>/radio</code> di Discord untuk memulai musik 24/7!</span></div>';
+                    return;
+                }}
+
+                let htmlCards = '';
+                for (const t of data.tracks) {{
+                    const titleEsc = escapeHtml(t.title);
+                    const titleShort = titleEsc.length > 45 ? titleEsc.slice(0, 45) + '…' : titleEsc;
+                    const uploaderEsc = escapeHtml(t.uploader);
+                    const guildEsc = escapeHtml(t.guild_name);
+                    const qInfo = t.queue_count > 0 ? `<span class="badge-queue">+ ${{t.queue_count}} di antrean</span>` : '';
+                    const apInfo = t.autoplay ? '<span class="badge-ap">📻 AutoPlay 24/7</span>' : '';
+
+                    htmlCards += `
+                    <div class="card" id="card-${{t.guild_id}}">
+                        <div class="thumb-container">
+                            <img src="${{escapeHtml(t.thumbnail)}}" alt="Thumbnail" class="card-thumb" onerror="this.src='https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=300'">
+                            <div class="equalizer">
+                                <span class="bar bar-1"></span>
+                                <span class="bar bar-2"></span>
+                                <span class="bar bar-3"></span>
+                                <span class="bar bar-4"></span>
+                            </div>
+                        </div>
+                        <div class="card-info">
+                            <div class="badge-row">
+                                <span class="badge-guild">📍 ${{guildEsc}}</span>
+                                ${{apInfo}}
+                                ${{qInfo}}
+                            </div>
+                            <div class="track-title" title="${{titleEsc}}">${{titleShort}}</div>
+                            <div class="track-artist">👤 ${{uploaderEsc}}</div>
+                            <div class="progress-bar-bg">
+                                <div class="progress-bar-fill" style="width: ${{t.progress_pct}}%"></div>
+                            </div>
+                            <div class="track-time"><span>${{t.elapsed_str}}</span><span>${{t.duration_str}}</span></div>
+                        </div>
+                    </div>
+                    `;
+                }}
+                container.innerHTML = htmlCards;
+
+            }} catch (err) {{
+                const pill = document.getElementById('statusPill');
+                const statusText = document.getElementById('statusText');
+                pill.style.background = 'rgba(244, 63, 94, 0.15)';
+                pill.style.borderColor = 'rgba(244, 63, 94, 0.3)';
+                pill.style.color = 'var(--accent-pink)';
+                statusText.textContent = 'RECONNECTING...';
+            }}
+        }}
+
+        // Poll every 3 seconds for real-time live updates
+        setInterval(updateDashboard, 3000);
+    </script>
 </body>
 </html>"""
-        return web.Response(text=html, content_type="text/html")
+        return web.Response(text=html_content, content_type="text/html")
 
     app.router.add_get("/", handle_dashboard)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/api/stats", handle_api_stats)
     return app
 
 

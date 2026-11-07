@@ -991,7 +991,7 @@ def play_next_song(guild_id: int, notify_channel: bool = True):
                 return
             if error:
                 logger.error(f"Error saat playback: {error}")
-            play_next_song(guild_id, notify_channel=True)
+            bot.loop.call_soon_threadsafe(play_next_song, guild_id, True)
 
         vc.play(volume_transformer, after=after_callback)
         queue.song_start_time = time.time()
@@ -1028,7 +1028,7 @@ def play_next_song(guild_id: int, notify_channel: bool = True):
             )
     except Exception as e:
         logger.error(f"Gagal memutar lagu: {e}")
-        play_next_song(guild_id)
+        bot.loop.call_soon_threadsafe(play_next_song, guild_id, True)
 
 
 def apply_audio_filter(guild_id: int, filter_key: str) -> dict:
@@ -1075,7 +1075,7 @@ def apply_audio_filter(guild_id: int, filter_key: str) -> dict:
                     return
                 if error:
                     logger.error(f"Error saat playback setelah reload filter: {error}")
-                play_next_song(guild_id)
+                bot.loop.call_soon_threadsafe(play_next_song, guild_id, True)
 
             vc.play(volume_transformer, after=after_callback)
 
@@ -2155,7 +2155,7 @@ async def cmd_seek(interaction: discord.Interaction, waktu: str):
                 return
             if error:
                 logger.error(f"Error playback after seek: {error}")
-            play_next_song(guild_id)
+            bot.loop.call_soon_threadsafe(play_next_song, guild_id, True)
 
         vc.play(volume_transformer, after=after_cb)
 
