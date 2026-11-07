@@ -10,9 +10,7 @@ services:
     environment:
       - PORT=8080
       - DB_PATH=/app/data/voice_tracker.db
-    # Web Dashboard & Healthcheck port (http://IP_VPS:8088/)
-    ports:
-      - "8088:8080"
+    # Port publik dinonaktifkan (tidak ada web dashboard yang diekspos ke IP VPS)
     volumes:
       # Penyimpanan data persisten untuk SQLite database & playlist
       - ./data:/app/data
