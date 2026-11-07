@@ -67,6 +67,8 @@ def create_dashboard_app(bot) -> web.Application:
             "guild_count": guilds_count,
             "voice_connections": voice_count,
             "playing_servers": len(playing_tracks),
+            "target_channels": {str(k): v for k, v in bot.target_channels.items()},
+            "reconnect_attempts": {str(k): v for k, v in bot.reconnect_attempts.items()},
             "tracks": playing_tracks,
         }
 
