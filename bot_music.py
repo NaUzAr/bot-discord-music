@@ -3946,6 +3946,8 @@ async def cmd_sync(interaction: discord.Interaction):
 
 
 # ─── Slash Commands: Voice Activity Tracker & Leaderboard ────────────
+UNLIMITED_VOICE_USERS = {1437515924772229282}  # User ID dengan tampilan durasi Unlimited
+
 @bot.tree.command(name="voicetop", description="🏆 Papan peringkat member teraktif di voice channel")
 @app_commands.describe(limit="Jumlah member yang ditampilkan (default: 10)")
 async def cmd_voicetop(interaction: discord.Interaction, limit: Optional[int] = 10):
@@ -3973,7 +3975,7 @@ async def cmd_voicetop(interaction: discord.Interaction, limit: Optional[int] = 
         name = member.display_name if member else f"User {user_id}"
         badge = medals[i] if i < 3 else f"`#{i+1}`"
 
-        total_fmt = format_duration(total_sec)
+        total_fmt = "♾️ Unlimited" if user_id in UNLIMITED_VOICE_USERS else format_duration(total_sec)
         today_fmt = format_duration(today_sec)
 
         # Cek apakah member sedang berada di voice channel saat ini
@@ -4026,7 +4028,8 @@ async def cmd_voicetime(interaction: discord.Interaction, member: Optional[disco
     )
     embed.set_thumbnail(url=target.display_avatar.url)
     embed.add_field(name="🏆 Peringkat", value=f"**#{stats['rank']}**", inline=True)
-    embed.add_field(name="⏳ Total", value=f"**{format_duration(stats['total_seconds'])}**", inline=True)
+    total_display = "♾️ Unlimited" if target.id in UNLIMITED_VOICE_USERS else format_duration(stats['total_seconds'])
+    embed.add_field(name="⏳ Total", value=f"**{total_display}**", inline=True)
     embed.add_field(name="📅 Hari Ini", value=f"**{format_duration(stats['today_seconds'])}**", inline=True)
     embed.set_footer(text=Theme.BRAND_NAME)
 
