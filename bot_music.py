@@ -267,7 +267,6 @@ class RythmVoiceBot(discord.Client):
         self.voice_clients_dict: Dict[int, discord.VoiceClient] = {}
         self.target_channels: Dict[int, int] = {}  # guild_id -> channel_id
         self.connected_since: Dict[int, datetime] = {}
-        self.empty_channel_timers: Dict[int, asyncio.Task] = {}
         self.reconnect_attempts: Dict[int, int] = {}
 
         # Music queues
@@ -279,57 +278,6 @@ class RythmVoiceBot(discord.Client):
         # Sleep Timer Manager
         self.sleep_timer = SleepTimerManager()
         self.start_time = time.time()
-
-    def schedule_empty_channel_disconnect(self, guild_id: int, channel_id: int):
-        """Jadwalkan bot keluar otomatis jika voice channel sepi (tidak ada manusia) selama 60 detik."""
-        if guild_id in self.empty_channel_timers:
-            return
-
-        async def _disconnect_if_still_empty():
-            try:
-                await asyncio.sleep(60)
-                vc = self.get_guild_voice_client(guild_id)
-                if vc and vc.channel and vc.channel.id == channel_id:
-                    humans = [m for m in vc.channel.members if not m.bot]
-                    if not humans:
-                        logger.info(f"👋 Voice channel '{vc.channel.name}' kosong selama 60 detik. Bot disconnect.")
-                        queue = self.get_queue(guild_id)
-                        queue.clear()
-                        self.target_channels.pop(guild_id, None)
-                        self.voice_clients_dict.pop(guild_id, None)
-                        self.connected_since.pop(guild_id, None)
-                        self.reconnect_attempts.pop(guild_id, None)
-                        if queue.text_channel:
-                            try:
-                                embed = styled_embed(
-                                    title="👋 Bot Keluar dari Voice Channel",
-                                    description=(
-                                        f"{Theme.SEPARATOR_THIN}\n"
-                                        "Semua member telah meninggalkan voice channel.\n"
-                                        "Bot otomatis keluar untuk menghemat penggunaan resource.\n\n"
-                                        "💡 *Ketik `/join` atau `/play` saat kamu ingin memutar musik lagi!*"
-                                    ),
-                                    color=Theme.IDLE,
-                                )
-                                await queue.text_channel.send(embed=embed)
-                            except Exception:
-                                pass
-                        try:
-                            await vc.disconnect()
-                        except Exception:
-                            pass
-            except asyncio.CancelledError:
-                pass
-            finally:
-                self.empty_channel_timers.pop(guild_id, None)
-
-        self.empty_channel_timers[guild_id] = asyncio.create_task(_disconnect_if_still_empty())
-
-    def cancel_empty_channel_disconnect(self, guild_id: int):
-        """Batalkan jadwal auto-leave jika ada member manusia yang masuk kembali."""
-        task = self.empty_channel_timers.pop(guild_id, None)
-        if task and not task.done():
-            task.cancel()
 
     def get_guild_voice_client(self, guild_id: int) -> Optional[discord.VoiceClient]:
         """Ambil voice client aktif untuk guild (sinkron otomatis dengan discord.Guild.voice_client)."""
@@ -427,16 +375,8 @@ class RythmVoiceBot(discord.Client):
                 )
                 self.voice_clients_dict.pop(guild_id, None)
                 self.connected_since.pop(guild_id, None)
-                # Hapus dari target_channels & reset attempt agar tidak reconnect spam!
-                self.target_channels.pop(guild_id, None)
-                self.reconnect_attempts.pop(guild_id, None)
-                self.cancel_empty_channel_disconnect(guild_id)
 
-                # Reset antrean & hentikan sesi pomodoro agar tidak menjadi zombie
-                queue = self.music_queues.get(guild_id)
-                if queue:
-                    queue.clear()
-
+                # Reset status presence & pomodoro
                 self.pomodoro.stop_session(guild_id)
                 asyncio.create_task(update_voice_channel_status(before.channel.id, None))
                 asyncio.create_task(update_bot_presence(None))
@@ -444,20 +384,9 @@ class RythmVoiceBot(discord.Client):
                 # Bot dipindahkan atau baru bergabung ke channel
                 self.target_channels[guild_id] = after.channel.id
                 self.reconnect_attempts[guild_id] = 0
-                self.cancel_empty_channel_disconnect(guild_id)
                 if member.guild.voice_client:
                     self.voice_clients_dict[guild_id] = member.guild.voice_client
             return
-
-        # 2. Deteksi jika member manusia keluar dan channel bot menjadi sepi (hanya bot sendirian)
-        guild_id = member.guild.id
-        vc = self.get_guild_voice_client(guild_id)
-        if vc and vc.channel:
-            humans = [m for m in vc.channel.members if not m.bot]
-            if len(humans) == 0:
-                self.schedule_empty_channel_disconnect(guild_id, vc.channel.id)
-            else:
-                self.cancel_empty_channel_disconnect(guild_id)
 
     # ─── Event Message (Prefix Command Fallback: !sleep, !sync, !np) ──
     async def on_message(self, message: discord.Message):
@@ -657,12 +586,6 @@ class RythmVoiceBot(discord.Client):
 
             channel = guild.get_channel(channel_id)
             if not channel:
-                self.target_channels.pop(guild_id, None)
-                continue
-
-            # JANGAN reconnect jika tidak ada member manusia di channel (hindari loop 4014)
-            humans = [m for m in channel.members if not m.bot]
-            if not humans:
                 self.target_channels.pop(guild_id, None)
                 continue
 
@@ -1465,7 +1388,6 @@ async def ensure_voice_connection(interaction: discord.Interaction) -> Optional[
             else:
                 await interaction.response.send_message(msg, ephemeral=True)
             return None
-        bot.cancel_empty_channel_disconnect(guild_id)
         bot.reconnect_attempts[guild_id] = 0
         return vc
     else:
@@ -1483,7 +1405,6 @@ async def ensure_voice_connection(interaction: discord.Interaction) -> Optional[
             bot.voice_clients_dict[guild_id] = vc
             bot.target_channels[guild_id] = user_channel.id
             bot.connected_since[guild_id] = datetime.now(timezone.utc)
-            bot.cancel_empty_channel_disconnect(guild_id)
             bot.reconnect_attempts[guild_id] = 0
         except discord.ClientException as e:
             # Antisipasi race condition: jika discord menganggap bot sudah terkoneksi
@@ -1491,7 +1412,6 @@ async def ensure_voice_connection(interaction: discord.Interaction) -> Optional[
                 vc = guild.voice_client
                 bot.voice_clients_dict[guild_id] = vc
                 bot.target_channels[guild_id] = user_channel.id
-                bot.cancel_empty_channel_disconnect(guild_id)
                 bot.reconnect_attempts[guild_id] = 0
                 if guild_id not in bot.connected_since:
                     bot.connected_since[guild_id] = datetime.now(timezone.utc)
@@ -4119,7 +4039,6 @@ async def cmd_leave(interaction: discord.Interaction):
     bot.connected_since.pop(guild_id, None)
     bot.voice_clients_dict.pop(guild_id, None)
     bot.reconnect_attempts.pop(guild_id, None)
-    bot.cancel_empty_channel_disconnect(guild_id)
 
     # Stop pomodoro & musik jika ada
     bot.pomodoro.stop_session(guild_id)
