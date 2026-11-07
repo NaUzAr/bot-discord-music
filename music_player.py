@@ -345,6 +345,8 @@ def format_duration(seconds: Optional[Any]) -> str:
         return "Live / Unknown"
     try:
         sec_int = int(float(seconds))
+        if sec_int == -1 or sec_int == 3596399:
+            return "♾️ Unlimited"
         if sec_int < 0:
             return "Live / Unknown"
         m, s = divmod(sec_int, 60)
@@ -353,6 +355,8 @@ def format_duration(seconds: Optional[Any]) -> str:
             return f"{h:02d}:{m:02d}:{s:02d}"
         return f"{m:02d}:{s:02d}"
     except (ValueError, TypeError):
+        if str(seconds).lower() in ["unlimited", "infinite", "inf"]:
+            return "♾️ Unlimited"
         return "Live / Unknown"
 
 
