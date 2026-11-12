@@ -62,6 +62,7 @@ from podcast_manager import (
     PodcastSelectView,
     PodcastCategoryView,
 )
+from message_logger import MessageLogger
 
 import sys
 import signal
@@ -193,6 +194,67 @@ def add_safe_fields(
         embed.add_field(name=field_name, value=chunk, inline=inline)
 
 
+def _has_log_admin_perm(member: discord.abc.User) -> bool:
+    """Cek apakah member memiliki hak Administrator atau Manage Server."""
+    if not isinstance(member, discord.Member):
+        return False
+    perms = member.guild_permissions
+    return perms.administrator or perms.manage_guild
+
+
+def _validate_log_channel(guild: discord.Guild, channel: Any) -> Optional[str]:
+    """Validasi izin bot pada channel log; mengembalikan pesan error atau None jika valid."""
+    if not isinstance(channel, discord.TextChannel):
+        return "❌ Channel tujuan harus berupa Text Channel biasa."
+    if not guild.me:
+        return "❌ Tidak dapat memverifikasi izin bot."
+    perms = channel.permissions_for(guild.me)
+    missing = []
+    if not perms.view_channel:
+        missing.append("View Channel")
+    if not perms.send_messages:
+        missing.append("Send Messages")
+    if not perms.embed_links:
+        missing.append("Embed Links")
+    if missing:
+        return f"❌ Bot kekurangan izin di {channel.mention}: `{', '.join(missing)}`."
+    return None
+
+
+def _build_log_status_embed(guild: discord.Guild, msg_logger: MessageLogger) -> discord.Embed:
+    """Bangun embed status konfigurasi log hapus pesan untuk server."""
+    cfg = msg_logger.get_config(guild.id)
+    if not cfg:
+        return styled_embed(
+            title="📝 Status Log Hapus Pesan",
+            description=(
+                "⚪ **Status:** Nonaktif\n\n"
+                "Gunakan `/loghapus set channel:#nama-channel` atau `!logset #nama-channel` "
+                "untuk mulai mencatat pesan yang dihapus & diedit."
+            ),
+            color=Theme.IDLE,
+        )
+
+    ch = guild.get_channel(cfg["log_channel_id"])
+    ch_display = ch.mention if ch else f"`Channel tidak ditemukan ({cfg['log_channel_id']})`"
+    edit_str = "✅ Aktif" if cfg.get("log_edits", True) else "⏹️ Mati"
+    bot_str = "✅ Ya (Abaikan Bot)" if cfg.get("ignore_bots", True) else "❌ Tidak (Catat Bot juga)"
+    audit_perm = "✅ Aktif" if (guild.me and guild.me.guild_permissions.view_audit_log) else "⚠️ Tidak Ada Izin View Audit Log"
+
+    return styled_embed(
+        title="📝 Status Log Hapus Pesan",
+        description=(
+            f"🟢 **Status:** Aktif\n"
+            f"📺 **Channel Log:** {ch_display}\n"
+            f"✏️ **Log Edit Pesan:** {edit_str}\n"
+            f"🤖 **Abaikan Pesan Bot:** {bot_str}\n"
+            f"🕵️ **Deteksi Penghapus (Audit Log):** {audit_perm}\n"
+            f"💾 **Pesan di Cache RAM:** `{len(msg_logger.ram_cache)} pesan`"
+        ),
+        color=Theme.SUCCESS,
+    )
+
+
 def build_now_playing_embed(
     song: Song,
     queue: GuildMusicQueue,
@@ -259,6 +321,7 @@ class RythmVoiceBot(discord.Client):
 
         super().__init__(
             intents=intents,
+            max_messages=5000,
             allowed_mentions=discord.AllowedMentions.none(),
         )
         self.tree = app_commands.CommandTree(self)
@@ -277,6 +340,9 @@ class RythmVoiceBot(discord.Client):
 
         # Sleep Timer Manager
         self.sleep_timer = SleepTimerManager()
+
+        # Message Delete & Edit Logger
+        self.msg_logger = MessageLogger(brand_name=Theme.BRAND_NAME)
         self.start_time = time.time()
 
     def get_guild_voice_client(self, guild_id: int) -> Optional[discord.VoiceClient]:
@@ -301,6 +367,7 @@ class RythmVoiceBot(discord.Client):
     async def setup_hook(self):
         """Inisialisasi database, persistent views, web dashboard, dan sinkronisasi slash commands."""
         await database.init_db()
+        await self.msg_logger.load_configs()
         self.add_view(MusicControlView(bot_instance=self))
         await self.tree.sync()
         logger.info("✅ Slash commands & Persistent views berhasil di-sync!")
@@ -316,6 +383,7 @@ class RythmVoiceBot(discord.Client):
                     await vc.disconnect(force=True)
             except Exception as e:
                 logger.warning(f"Error disconnect voice guild {gid}: {e}")
+        await self.msg_logger.close()
         await super().close()
         logger.info("👋 Bot berhasil dimatikan secara bersih (graceful shutdown).")
 
@@ -422,9 +490,15 @@ class RythmVoiceBot(discord.Client):
                     self.voice_clients_dict[guild_id] = member.guild.voice_client
             return
 
-    # ─── Event Message (Prefix Command Fallback: !sleep, !sync, !np) ──
+    # ─── Event Message (Cache Logger & Prefix Command Fallback) ───────
     async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild:
+        if not message.guild:
+            return
+
+        # Rekam pesan masuk untuk log hapus/edit pesan (termasuk filter ignore_bots internal)
+        self.msg_logger.record_message(message)
+
+        if message.author.bot:
             return
 
         content = message.content.strip()
@@ -601,7 +675,45 @@ class RythmVoiceBot(discord.Client):
             await message.reply("⏹️ Musik dihentikan. (Ketik `/play` untuk memutar kembali, atau `!leave` agar bot keluar dari voice)")
             return
 
+        # Command prefix !logset / !logoff / !logstatus
+        if lower_content.startswith("!logset"):
+            if not _has_log_admin_perm(message.author):
+                await message.reply("❌ Hanya Admin / pemilik izin `Manage Server` yang dapat mengatur log pesan.")
+                return
+            target_ch = message.channel_mentions[0] if message.channel_mentions else message.channel
+            err = _validate_log_channel(message.guild, target_ch)
+            if err:
+                await message.reply(err)
+                return
+            await self.msg_logger.set_config(message.guild.id, target_ch.id, log_edits=True, ignore_bots=True)
+            await message.reply(
+                f"✅ **Log Hapus & Edit Pesan diaktifkan** di {target_ch.mention}!\n"
+                f"• Gunakan `/loghapus status` untuk cek detail atau `/loghapus off` untuk mematikan."
+            )
+            return
 
+        if lower_content in ["!logoff", "!logdisable"]:
+            if not _has_log_admin_perm(message.author):
+                await message.reply("❌ Hanya Admin / pemilik izin `Manage Server` yang dapat mematikan log pesan.")
+                return
+            disabled = await self.msg_logger.disable_config(message.guild.id)
+            msg = "⏹️ **Log Hapus Pesan dimatikan** untuk server ini." if disabled else "ℹ️ Log hapus pesan memang belum aktif."
+            await message.reply(msg)
+            return
+
+        if lower_content == "!logstatus":
+            await message.reply(embed=_build_log_status_embed(message.guild, self.msg_logger))
+            return
+
+    # ─── Event Log Hapus & Edit Pesan ─────────────────────────────────
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        await self.msg_logger.handle_raw_message_delete(self, payload)
+
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent):
+        await self.msg_logger.handle_raw_bulk_message_delete(self, payload)
+
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
+        await self.msg_logger.handle_raw_message_edit(self, payload)
 
     # ─── Background Tasks ─────────────────────────────────────────────
     @tasks.loop(seconds=60)
@@ -4158,6 +4270,136 @@ async def cmd_voicestatus(interaction: discord.Interaction, teks: Optional[str] 
         await interaction.response.send_message(f"🧹 Status Voice Channel **{channel.name}** telah dibersihkan.")
 
 
+# ─── Slash Commands: Log Hapus & Edit Pesan ──────────────────────────
+loghapus_group = app_commands.Group(
+    name="loghapus",
+    description="🗑️ Kelola log otomatis pesan yang dihapus & diedit di server",
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+@loghapus_group.command(name="set", description="📌 Aktifkan dan pilih channel tujuan log hapus pesan")
+@app_commands.describe(
+    channel="Channel teks tujuan pengiriman log (misal: #log-delete)",
+    log_edit="Juga catat pesan yang diedit Sebelum -> Sesudah? (default: Ya)",
+    abaikan_bot="Abaikan pesan dari bot agar log tidak penuh spam? (default: Ya)",
+)
+async def loghapus_set(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    log_edit: bool = True,
+    abaikan_bot: bool = True,
+):
+    if not interaction.guild or not _has_log_admin_perm(interaction.user):
+        await interaction.response.send_message(
+            "❌ Hanya Admin atau pemilik izin `Manage Server` yang dapat mengatur log pesan.",
+            ephemeral=True,
+        )
+        return
+
+    err = _validate_log_channel(interaction.guild, channel)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+
+    await bot.msg_logger.set_config(
+        guild_id=interaction.guild.id,
+        log_channel_id=channel.id,
+        log_edits=log_edit,
+        ignore_bots=abaikan_bot,
+    )
+
+    embed = styled_embed(
+        title="✅ Log Hapus Pesan Aktif",
+        description=(
+            f"Seluruh pesan yang dihapus di server **{interaction.guild.name}** akan otomatis dicatat ke {channel.mention}.\n\n"
+            f"• **Log Edit Pesan:** `{'Aktif' if log_edit else 'Mati'}`\n"
+            f"• **Abaikan Pesan Bot:** `{'Ya' if abaikan_bot else 'Tidak'}`\n"
+            f"• **Cache Persisten:** `Aktif (RAM + SQLite)`"
+        ),
+        color=Theme.SUCCESS,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@loghapus_group.command(name="status", description="📊 Cek konfigurasi log hapus pesan di server ini")
+async def loghapus_status(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Hanya dapat digunakan di dalam server.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        embed=_build_log_status_embed(interaction.guild, bot.msg_logger),
+        ephemeral=True,
+    )
+
+
+@loghapus_group.command(name="off", description="⏹️ Matikan pencatatan log hapus pesan di server ini")
+async def loghapus_off(interaction: discord.Interaction):
+    if not interaction.guild or not _has_log_admin_perm(interaction.user):
+        await interaction.response.send_message(
+            "❌ Hanya Admin atau pemilik izin `Manage Server` yang dapat mematikan log pesan.",
+            ephemeral=True,
+        )
+        return
+
+    disabled = await bot.msg_logger.disable_config(interaction.guild.id)
+    if disabled:
+        embed = styled_embed(
+            title="⏹️ Log Hapus Pesan Dimatikan",
+            description="Bot tidak lagi mencatat pesan yang dihapus/diedit di server ini.",
+            color=Theme.IDLE,
+        )
+    else:
+        embed = styled_embed(
+            title="ℹ️ Sudah Nonaktif",
+            description="Fitur log hapus pesan memang belum aktif di server ini.",
+            color=Theme.INFO,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@loghapus_group.command(name="test", description="🧪 Kirim contoh pesan tes ke channel log yang aktif")
+async def loghapus_test(interaction: discord.Interaction):
+    if not interaction.guild or not _has_log_admin_perm(interaction.user):
+        await interaction.response.send_message(
+            "❌ Hanya Admin atau pemilik izin `Manage Server` yang dapat menjalankan tes log.",
+            ephemeral=True,
+        )
+        return
+
+    cfg = bot.msg_logger.get_config(interaction.guild.id)
+    if not cfg:
+        await interaction.response.send_message(
+            "⚠️ Log hapus pesan belum dikonfigurasi. Jalankan `/loghapus set` terlebih dahulu.",
+            ephemeral=True,
+        )
+        return
+
+    target_ch = interaction.guild.get_channel(cfg["log_channel_id"])
+    if not isinstance(target_ch, discord.TextChannel):
+        await interaction.response.send_message("❌ Channel log tidak ditemukan atau sudah dihapus.", ephemeral=True)
+        return
+
+    err = _validate_log_channel(interaction.guild, target_ch)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+
+    test_embed = styled_embed(
+        title="🧪 Tes Log Hapus Pesan Berhasil",
+        description=(
+            f"Channel {target_ch.mention} siap menerima log pesan yang dihapus & diedit.\n"
+            f"**Dites oleh:** {interaction.user.mention}"
+        ),
+        color=Theme.INFO,
+    )
+    await target_ch.send(embed=test_embed)
+    await interaction.response.send_message(f"✅ Pesan tes berhasil dikirim ke {target_ch.mention}!", ephemeral=True)
+
+
+bot.tree.add_command(loghapus_group)
+
+
 @bot.tree.command(name="help", description="📖 Panduan lengkap perintah dan fitur bot")
 async def cmd_help(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -4208,6 +4450,7 @@ async def cmd_help(interaction: discord.Interaction):
             "`/dashboard` — Web Live Dashboard & Stats\n"
             "`/join` · `/leave` — Kontrol voice bot 24/7\n"
             "`/voicestatus` — Pasang status voice channel\n"
+            "`/loghapus set` — Log pesan dihapus & diedit\n"
             "`/status` — Cek ping, uptime & memori\n"
             "\n"
             "🌙 **Sleep Timer**\n"

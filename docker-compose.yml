@@ -28,6 +28,7 @@ services:
       - ./sleep_timer.py:/app/sleep_timer.py
       - ./pomodoro.py:/app/pomodoro.py
       - ./podcast_manager.py:/app/podcast_manager.py
+      - ./message_logger.py:/app/message_logger.py
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s

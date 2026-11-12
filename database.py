@@ -64,6 +64,37 @@ async def init_db():
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_log_settings (
+                guild_id INTEGER PRIMARY KEY,
+                log_channel_id INTEGER NOT NULL,
+                log_edits INTEGER DEFAULT 1,
+                ignore_bots INTEGER DEFAULT 1
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_cache (
+                message_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                author_id INTEGER NOT NULL,
+                author_name TEXT NOT NULL,
+                author_display_name TEXT NOT NULL,
+                author_avatar TEXT,
+                author_is_bot INTEGER DEFAULT 0,
+                content TEXT,
+                attachments_json TEXT,
+                stickers_json TEXT,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_message_cache_created ON message_cache(created_at)"
+        )
         await db.commit()
     logger.info("📦 SQLite database initialized (async).")
 
@@ -349,4 +380,203 @@ async def get_all_247_channels() -> Dict[int, int]:
     except Exception as e:
         logger.error(f"Gagal memuat 24/7 voice channels: {e}")
         return {}
+
+
+# ─── Message Delete & Edit Log Settings + Persistent Cache ───────────
+async def set_message_log_config(
+    guild_id: int,
+    log_channel_id: int,
+    log_edits: bool = True,
+    ignore_bots: bool = True,
+):
+    """Menyimpan konfigurasi channel log hapus/edit pesan untuk server."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO message_log_settings
+                (guild_id, log_channel_id, log_edits, ignore_bots)
+                VALUES (?, ?, ?, ?)
+                """,
+                (guild_id, log_channel_id, 1 if log_edits else 0, 1 if ignore_bots else 0),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Gagal menyimpan message log config: {e}")
+
+
+async def disable_message_log(guild_id: int) -> bool:
+    """Menonaktifkan log hapus/edit pesan untuk server ini."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "DELETE FROM message_log_settings WHERE guild_id = ?", (guild_id,)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Gagal menonaktifkan message log: {e}")
+        return False
+
+
+async def get_all_message_log_configs() -> Dict[int, Dict[str, Any]]:
+    """Mengambil seluruh konfigurasi log pesan semua server."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT guild_id, log_channel_id, log_edits, ignore_bots FROM message_log_settings"
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return {
+                    row[0]: {
+                        "guild_id": row[0],
+                        "log_channel_id": row[1],
+                        "log_edits": bool(row[2]),
+                        "ignore_bots": bool(row[3]),
+                    }
+                    for row in rows
+                }
+    except Exception as e:
+        logger.error(f"Gagal memuat message log configs: {e}")
+        return {}
+
+
+def _row_to_cached_msg(row: tuple) -> Dict[str, Any]:
+    """Konversi baris SQLite message_cache menjadi dict terstruktur."""
+    return {
+        "message_id": row[0],
+        "guild_id": row[1],
+        "channel_id": row[2],
+        "author_id": row[3],
+        "author_name": row[4],
+        "author_display_name": row[5],
+        "author_avatar": row[6],
+        "author_is_bot": bool(row[7]),
+        "content": row[8] or "",
+        "attachments": json.loads(row[9]) if row[9] else [],
+        "stickers": json.loads(row[10]) if row[10] else [],
+        "created_at": row[11],
+    }
+
+
+async def save_cached_message(msg_data: Dict[str, Any]):
+    """Menyimpan metadata & isi pesan ke cache persisten SQLite."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO message_cache
+                (message_id, guild_id, channel_id, author_id, author_name,
+                 author_display_name, author_avatar, author_is_bot, content,
+                 attachments_json, stickers_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    msg_data["message_id"],
+                    msg_data["guild_id"],
+                    msg_data["channel_id"],
+                    msg_data["author_id"],
+                    msg_data["author_name"],
+                    msg_data["author_display_name"],
+                    msg_data.get("author_avatar"),
+                    1 if msg_data.get("author_is_bot") else 0,
+                    msg_data.get("content", ""),
+                    json.dumps(msg_data.get("attachments", [])),
+                    json.dumps(msg_data.get("stickers", [])),
+                    msg_data["created_at"],
+                ),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.debug(f"Gagal menyimpan cached message {msg_data.get('message_id')}: {e}")
+
+
+async def update_cached_message(message_id: int, new_content: str):
+    """Memperbarui teks pesan di cache SQLite saat pesan diedit."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE message_cache SET content = ? WHERE message_id = ?",
+                (new_content, message_id),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.debug(f"Gagal memperbarui cached message {message_id}: {e}")
+
+
+async def get_cached_message(message_id: int) -> Optional[Dict[str, Any]]:
+    """Mengambil pesan dari cache SQLite berdasarkan ID pesan."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                """
+                SELECT message_id, guild_id, channel_id, author_id, author_name,
+                       author_display_name, author_avatar, author_is_bot, content,
+                       attachments_json, stickers_json, created_at
+                FROM message_cache WHERE message_id = ?
+                """,
+                (message_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return _row_to_cached_msg(row) if row else None
+    except Exception as e:
+        logger.debug(f"Gagal membaca cached message {message_id}: {e}")
+        return None
+
+
+async def get_cached_messages_bulk(message_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    """Mengambil banyak pesan sekaligus dari cache SQLite untuk log bulk delete."""
+    if not message_ids:
+        return {}
+    try:
+        placeholders = ",".join("?" for _ in message_ids)
+        query = (
+            "SELECT message_id, guild_id, channel_id, author_id, author_name, "
+            "author_display_name, author_avatar, author_is_bot, content, "
+            "attachments_json, stickers_json, created_at "
+            f"FROM message_cache WHERE message_id IN ({placeholders})"
+        )
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(query, tuple(message_ids)) as cursor:
+                rows = await cursor.fetchall()
+                return {row[0]: _row_to_cached_msg(row) for row in rows}
+    except Exception as e:
+        logger.debug(f"Gagal membaca bulk cached messages: {e}")
+        return {}
+
+
+async def delete_cached_messages(message_ids: List[int]):
+    """Menghapus pesan dari cache SQLite setelah berhasil di-log."""
+    if not message_ids:
+        return
+    try:
+        placeholders = ",".join("?" for _ in message_ids)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                f"DELETE FROM message_cache WHERE message_id IN ({placeholders})",
+                tuple(message_ids),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.debug(f"Gagal menghapus cached messages: {e}")
+
+
+async def prune_message_cache(max_rows: int = 5000):
+    """Memangkas cache pesan lama agar ukuran database SQLite tetap ringan."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                DELETE FROM message_cache
+                WHERE message_id NOT IN (
+                    SELECT message_id FROM message_cache
+                    ORDER BY created_at DESC LIMIT ?
+                )
+                """,
+                (max_rows,),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.debug(f"Gagal memangkas message cache: {e}")
+
 
