@@ -63,6 +63,7 @@ from podcast_manager import (
     PodcastCategoryView,
 )
 from message_logger import MessageLogger
+from mirror_manager import ChannelMirrorManager
 
 import sys
 import signal
@@ -257,6 +258,102 @@ def _build_log_status_embed(guild: discord.Guild, msg_logger: MessageLogger) -> 
     )
 
 
+def _resolve_mirror_channel(
+    bot_client: discord.Client,
+    channel_obj: Optional[discord.TextChannel],
+    channel_id_str: Optional[str],
+) -> Optional[discord.TextChannel]:
+    """Resolusi channel baik dari argumen channel langsung maupun string ID."""
+    if channel_obj is not None:
+        return channel_obj
+    if channel_id_str and channel_id_str.strip().isdigit():
+        ch = bot_client.get_channel(int(channel_id_str.strip()))
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    return None
+
+
+def _validate_mirror_pair(
+    bot_client: "RythmVoiceBot",
+    actor: discord.abc.User,
+    source_ch: Optional[discord.TextChannel],
+    target_ch: Optional[discord.TextChannel],
+) -> Optional[str]:
+    """Validasi pasangan channel sumber & tujuan mirror termasuk izin lintas server."""
+    if not isinstance(source_ch, discord.TextChannel) or not isinstance(target_ch, discord.TextChannel):
+        return "❌ Channel sumber dan tujuan harus berupa Text Channel yang dapat diakses bot."
+    if source_ch.id == target_ch.id:
+        return "❌ Channel sumber dan channel tujuan tidak boleh sama!"
+    if bot_client.mirror_manager.has_reverse_mirror(source_ch.id, target_ch.id):
+        return "❌ Aturan mirror dua arah tidak diizinkan agar tidak terjadi loop pesan!"
+
+    # Cek izin admin pada server sumber dan tujuan (wajib bila lintas server)
+    for g in {source_ch.guild, target_ch.guild}:
+        member = g.get_member(actor.id)
+        if not _has_log_admin_perm(member):
+            return f"❌ Kamu harus memiliki izin Admin / `Manage Server` di server **{g.name}**."
+
+    if source_ch.guild.me:
+        sp = source_ch.permissions_for(source_ch.guild.me)
+        if not sp.view_channel or not sp.read_message_history:
+            return f"❌ Bot membutuhkan izin `View Channel` & `Read Message History` di {source_ch.mention}."
+    if target_ch.guild.me:
+        tp = target_ch.permissions_for(target_ch.guild.me)
+        if not tp.view_channel or not tp.manage_webhooks:
+            return f"❌ Bot membutuhkan izin `View Channel` & `Manage Webhooks` di {target_ch.mention}."
+
+    return None
+
+
+def _build_mirror_list_embed(
+    bot_client: discord.Client,
+    guild: discord.Guild,
+    mirror_manager: ChannelMirrorManager,
+) -> discord.Embed:
+    """Bangun embed daftar aturan mirror channel untuk server ini."""
+    mirrors = mirror_manager.get_guild_mirrors(guild.id)
+    if not mirrors:
+        return styled_embed(
+            title="🪞 Daftar Channel Mirror",
+            description=(
+                "⚪ Belum ada aturan mirror yang terdaftar di server ini.\n\n"
+                "Gunakan `/mirror add sumber:#channel-a tujuan:#channel-b` atau "
+                "`!mirror #channel-a #channel-b` untuk mulai mencerminkan chat via Webhook."
+            ),
+            color=Theme.IDLE,
+        )
+
+    lines = []
+    for m in mirrors:
+        status = "🟢 Aktif" if m["enabled"] else "⏸️ Dijeda"
+        src_ch = bot_client.get_channel(m["source_channel_id"])
+        tgt_ch = bot_client.get_channel(m["target_channel_id"])
+        src_label = src_ch.mention if src_ch else f"`#{m['source_channel_id']}`"
+        tgt_label = tgt_ch.mention if tgt_ch else f"`#{m['target_channel_id']}`"
+        if m["source_guild_id"] != m["target_guild_id"]:
+            src_g = bot_client.get_guild(m["source_guild_id"])
+            tgt_g = bot_client.get_guild(m["target_guild_id"])
+            src_label += f" ({src_g.name if src_g else m['source_guild_id']})"
+            tgt_label += f" ({tgt_g.name if tgt_g else m['target_guild_id']})"
+        opts = []
+        opts.append("Abaikan Bot" if m["ignore_bots"] else "Catat Bot")
+        if m.get("show_source"):
+            opts.append("Tag Asal")
+        lines.append(
+            f"**ID `#{m['id']}`** · {status}\n"
+            f"  {src_label} ➡️ {tgt_label} *({', '.join(opts)})*"
+        )
+
+    embed = styled_embed(
+        title=f"🪞 Daftar Channel Mirror — {guild.name}",
+        description=f"Total: **{len(mirrors)} aturan** aktif/terdaftar:\n",
+        color=Theme.INFO,
+    )
+    add_safe_fields(embed, name="📌 Rute Webhook Mirror", lines=lines, max_chars=950, inline=False)
+    embed.set_footer(text=f"Kelola via /mirror toggle atau /mirror remove  •  {Theme.BRAND_NAME}")
+    return embed
+
+
 def build_now_playing_embed(
     song: Song,
     queue: GuildMusicQueue,
@@ -345,6 +442,9 @@ class RythmVoiceBot(discord.Client):
 
         # Message Delete & Edit Logger
         self.msg_logger = MessageLogger(brand_name=Theme.BRAND_NAME)
+
+        # Channel Mirroring Proxy Manager
+        self.mirror_manager = ChannelMirrorManager(ref_lookup=self.msg_logger.ram_cache.get)
         self.start_time = time.time()
 
     def get_guild_voice_client(self, guild_id: int) -> Optional[discord.VoiceClient]:
@@ -370,6 +470,7 @@ class RythmVoiceBot(discord.Client):
         """Inisialisasi database, persistent views, web dashboard, dan sinkronisasi slash commands."""
         await database.init_db()
         await self.msg_logger.load_configs()
+        await self.mirror_manager.load_mirrors()
         self.add_view(MusicControlView(bot_instance=self))
         await self.tree.sync()
         logger.info("✅ Slash commands & Persistent views berhasil di-sync!")
@@ -386,6 +487,7 @@ class RythmVoiceBot(discord.Client):
             except Exception as e:
                 logger.warning(f"Error disconnect voice guild {gid}: {e}")
         await self.msg_logger.close()
+        await self.mirror_manager.close()
         await super().close()
         logger.info("👋 Bot berhasil dimatikan secara bersih (graceful shutdown).")
 
@@ -499,6 +601,9 @@ class RythmVoiceBot(discord.Client):
 
         # Rekam pesan masuk untuk log hapus/edit pesan (termasuk filter ignore_bots internal)
         self.msg_logger.record_message(message)
+
+        # Teruskan pesan ke mirror webhook jika channel sumber aktif di-mirror
+        asyncio.create_task(self.mirror_manager.handle_message(self, message))
 
         if message.author.bot:
             return
@@ -705,6 +810,79 @@ class RythmVoiceBot(discord.Client):
 
         if lower_content == "!logstatus":
             await message.reply(embed=_build_log_status_embed(message.guild, self.msg_logger))
+            return
+
+        # Command prefix !mirror / !mirror-list / !mirror-del / !mirror-toggle
+        if lower_content == "!mirror-list":
+            await message.reply(embed=_build_mirror_list_embed(self, message.guild, self.mirror_manager))
+            return
+
+        if lower_content.startswith("!mirror-del ") or lower_content.startswith("!mirror-off "):
+            if not _has_log_admin_perm(message.author):
+                await message.reply("❌ Hanya Admin / pemilik izin `Manage Server` yang dapat menghapus mirror.")
+                return
+            arg = content.split(maxsplit=1)[1].lstrip("#")
+            if not arg.isdigit():
+                await message.reply("❌ Format: `!mirror-del <ID>` (cek ID di `!mirror-list`).")
+                return
+            mid = int(arg)
+            cfg = self.mirror_manager.mirrors_by_id.get(mid)
+            if not cfg or (cfg["source_guild_id"] != message.guild.id and cfg["target_guild_id"] != message.guild.id):
+                await message.reply(f"❌ Mirror ID `#{mid}` tidak ditemukan di server ini.")
+                return
+            await self.mirror_manager.remove_mirror(mid)
+            await message.reply(f"🗑️ Mirror **#{mid}** berhasil dihapus.")
+            return
+
+        if lower_content.startswith("!mirror-toggle "):
+            if not _has_log_admin_perm(message.author):
+                await message.reply("❌ Hanya Admin / pemilik izin `Manage Server` yang dapat mengubah status mirror.")
+                return
+            arg = content.split(maxsplit=1)[1].lstrip("#")
+            if not arg.isdigit():
+                await message.reply("❌ Format: `!mirror-toggle <ID>`.")
+                return
+            mid = int(arg)
+            cfg = self.mirror_manager.mirrors_by_id.get(mid)
+            if not cfg or (cfg["source_guild_id"] != message.guild.id and cfg["target_guild_id"] != message.guild.id):
+                await message.reply(f"❌ Mirror ID `#{mid}` tidak ditemukan di server ini.")
+                return
+            new_state = await self.mirror_manager.toggle_mirror(mid)
+            state_txt = "🟢 **Diaktifkan kembali**" if new_state else "⏸️ **Dijeda**"
+            await message.reply(f"{state_txt} untuk Mirror **#{mid}**.")
+            return
+
+        if lower_content == "!mirror" or lower_content.startswith("!mirror "):
+            if not _has_log_admin_perm(message.author):
+                await message.reply("❌ Hanya Admin / pemilik izin `Manage Server` yang dapat mengatur mirror.")
+                return
+            parts = content.split()
+            src_ch = message.channel_mentions[0] if len(message.channel_mentions) >= 1 else (
+                _resolve_mirror_channel(self, None, parts[1]) if len(parts) >= 2 else None
+            )
+            tgt_ch = message.channel_mentions[1] if len(message.channel_mentions) >= 2 else (
+                _resolve_mirror_channel(self, None, parts[2]) if len(parts) >= 3 else None
+            )
+            if not src_ch or not tgt_ch:
+                await message.reply(
+                    "ℹ️ Cara pakai:\n"
+                    "• `!mirror #channel-sumber #channel-tujuan`\n"
+                    "• `!mirror <ID_channel_sumber> <ID_channel_tujuan>` (untuk lintas server)\n"
+                    "• `!mirror-list` | `!mirror-toggle <ID>` | `!mirror-del <ID>`"
+                )
+                return
+            err = _validate_mirror_pair(self, message.author, src_ch, tgt_ch)
+            if err:
+                await message.reply(err)
+                return
+            try:
+                mid = await self.mirror_manager.add_mirror(src_ch, tgt_ch, created_by=message.author.id)
+                await message.reply(
+                    f"✅ **Channel Mirroring aktif (ID `#{mid}`)**!\n"
+                    f"Setiap chat & lampiran di {src_ch.mention} otomatis di-mirror ke {tgt_ch.mention} via Webhook."
+                )
+            except Exception as e:
+                await message.reply(f"❌ Gagal membuat webhook mirror: `{e}`")
             return
 
     # ─── Event Log Hapus & Edit Pesan ─────────────────────────────────
@@ -4406,6 +4584,149 @@ async def loghapus_test(interaction: discord.Interaction):
 bot.tree.add_command(loghapus_group)
 
 
+# ─── Slash Commands: Channel Mirroring via Webhook ───────────────────
+mirror_group = app_commands.Group(
+    name="mirror",
+    description="🪞 Mirror chat & lampiran real-time antar channel via Webhook",
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+async def mirror_id_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[int]]:
+    if not interaction.guild:
+        return []
+    mirrors = bot.mirror_manager.get_guild_mirrors(interaction.guild.id)
+    choices: List[app_commands.Choice[int]] = []
+    for m in mirrors:
+        src_ch = bot.get_channel(m["source_channel_id"])
+        tgt_ch = bot.get_channel(m["target_channel_id"])
+        src_name = f"#{src_ch.name}" if src_ch else str(m["source_channel_id"])
+        tgt_name = f"#{tgt_ch.name}" if tgt_ch else str(m["target_channel_id"])
+        state_icon = "🟢" if m["enabled"] else "⏸️"
+        label = f"#{m['id']} {state_icon} {src_name} -> {tgt_name}"[:100]
+        if not current or current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label, value=m["id"]))
+    return choices[:25]
+
+
+@mirror_group.command(name="add", description="📌 Buat jalur mirror chat real-time dari channel sumber ke tujuan via Webhook")
+@app_commands.describe(
+    sumber="Channel asal di server ini (opsional jika pakai sumber_id lintas server)",
+    tujuan="Channel tujuan mirror di server ini (opsional jika pakai tujuan_id lintas server)",
+    abaikan_bot="Abaikan pesan dari bot & webhook lain? (default: Ya)",
+    tampilkan_asal="Tampilkan nama #channel asal di samping nama pengirim? (default: Tidak)",
+    sumber_id="Opsional: ID Channel sumber jika ingin mirror dari server lain",
+    tujuan_id="Opsional: ID Channel tujuan jika ingin mirror ke server lain",
+)
+async def mirror_add(
+    interaction: discord.Interaction,
+    sumber: Optional[discord.TextChannel] = None,
+    tujuan: Optional[discord.TextChannel] = None,
+    abaikan_bot: bool = True,
+    tampilkan_asal: bool = False,
+    sumber_id: Optional[str] = None,
+    tujuan_id: Optional[str] = None,
+):
+    if not interaction.guild or not _has_log_admin_perm(interaction.user):
+        await interaction.response.send_message(
+            "❌ Hanya Admin atau pemilik izin `Manage Server` yang dapat mengatur mirror channel.",
+            ephemeral=True,
+        )
+        return
+
+    src_ch = _resolve_mirror_channel(bot, sumber, sumber_id)
+    tgt_ch = _resolve_mirror_channel(bot, tujuan, tujuan_id)
+    if not src_ch or not tgt_ch:
+        await interaction.response.send_message(
+            "❌ Tentukan channel `sumber` dan `tujuan` (atau isi `sumber_id` / `tujuan_id` yang valid).",
+            ephemeral=True,
+        )
+        return
+
+    err = _validate_mirror_pair(bot, interaction.user, src_ch, tgt_ch)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        mirror_id = await bot.mirror_manager.add_mirror(
+            source_channel=src_ch,
+            target_channel=tgt_ch,
+            ignore_bots=abaikan_bot,
+            show_source=tampilkan_asal,
+            created_by=interaction.user.id,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ Gagal membuat Webhook di {tgt_ch.mention}: `{e}`", ephemeral=True)
+        return
+
+    embed = styled_embed(
+        title="🪞 Channel Mirroring Aktif!",
+        description=(
+            f"Pesan & lampiran dari {src_ch.mention} kini otomatis dicerminkan ke {tgt_ch.mention} via **Webhook**.\n\n"
+            f"• **ID Mirror:** `#{mirror_id}`\n"
+            f"• **Abaikan Bot:** `{'Ya' if abaikan_bot else 'Tidak'}`\n"
+            f"• **Tag Channel Asal:** `{'Ya' if tampilkan_asal else 'Tidak'}`\n"
+            f"• **Balasan (Reply) & File:** `Ikut diteruskan permanen`"
+        ),
+        color=Theme.SUCCESS,
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@mirror_group.command(name="list", description="📋 Lihat daftar seluruh channel mirror di server ini")
+async def mirror_list(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Hanya dapat digunakan di dalam server.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        embed=_build_mirror_list_embed(bot, interaction.guild, bot.mirror_manager),
+        ephemeral=True,
+    )
+
+
+@mirror_group.command(name="toggle", description="⏯️ Jeda atau aktifkan kembali aturan mirror tertentu")
+@app_commands.describe(mirror_id="Pilih aturan mirror yang ingin dijeda/diaktifkan")
+@app_commands.autocomplete(mirror_id=mirror_id_autocomplete)
+async def mirror_toggle(interaction: discord.Interaction, mirror_id: int):
+    if not interaction.guild or not _has_log_admin_perm(interaction.user):
+        await interaction.response.send_message("❌ Hanya Admin / `Manage Server`.", ephemeral=True)
+        return
+
+    cfg = bot.mirror_manager.mirrors_by_id.get(mirror_id)
+    if not cfg or (cfg["source_guild_id"] != interaction.guild.id and cfg["target_guild_id"] != interaction.guild.id):
+        await interaction.response.send_message(f"❌ Mirror ID `#{mirror_id}` tidak ditemukan di server ini.", ephemeral=True)
+        return
+
+    new_state = await bot.mirror_manager.toggle_mirror(mirror_id)
+    state_str = "🟢 **Diaktifkan kembali**" if new_state else "⏸️ **Dijeda sementara**"
+    await interaction.response.send_message(f"{state_str} untuk Mirror **#{mirror_id}**.", ephemeral=True)
+
+
+@mirror_group.command(name="remove", description="🗑️ Hapus aturan mirror channel secara permanen")
+@app_commands.describe(mirror_id="Pilih aturan mirror yang ingin dihapus")
+@app_commands.autocomplete(mirror_id=mirror_id_autocomplete)
+async def mirror_remove(interaction: discord.Interaction, mirror_id: int):
+    if not interaction.guild or not _has_log_admin_perm(interaction.user):
+        await interaction.response.send_message("❌ Hanya Admin / `Manage Server`.", ephemeral=True)
+        return
+
+    cfg = bot.mirror_manager.mirrors_by_id.get(mirror_id)
+    if not cfg or (cfg["source_guild_id"] != interaction.guild.id and cfg["target_guild_id"] != interaction.guild.id):
+        await interaction.response.send_message(f"❌ Mirror ID `#{mirror_id}` tidak ditemukan di server ini.", ephemeral=True)
+        return
+
+    await bot.mirror_manager.remove_mirror(mirror_id)
+    await interaction.response.send_message(f"🗑️ Aturan Mirror **#{mirror_id}** berhasil dihapus.", ephemeral=True)
+
+
+bot.tree.add_command(mirror_group)
+
+
 @bot.tree.command(name="help", description="📖 Panduan lengkap perintah dan fitur bot")
 async def cmd_help(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -4457,6 +4778,7 @@ async def cmd_help(interaction: discord.Interaction):
             "`/join` · `/leave` — Kontrol voice bot 24/7\n"
             "`/voicestatus` — Pasang status voice channel\n"
             "`/loghapus set` — Log pesan dihapus & diedit\n"
+            "`/mirror add` — Mirror chat via Webhook\n"
             "`/status` — Cek ping, uptime & memori\n"
             "\n"
             "🌙 **Sleep Timer**\n"

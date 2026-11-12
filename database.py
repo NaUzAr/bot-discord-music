@@ -103,6 +103,23 @@ async def init_db():
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_message_cache_created ON message_cache(created_at)"
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channel_mirrors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_guild_id INTEGER NOT NULL,
+                source_channel_id INTEGER NOT NULL,
+                target_guild_id INTEGER NOT NULL,
+                target_channel_id INTEGER NOT NULL,
+                webhook_url TEXT NOT NULL,
+                ignore_bots INTEGER DEFAULT 1,
+                show_source INTEGER DEFAULT 0,
+                enabled INTEGER DEFAULT 1,
+                created_by INTEGER,
+                UNIQUE(source_channel_id, target_channel_id)
+            )
+            """
+        )
         await db.commit()
     logger.info("📦 SQLite database initialized (async).")
 
@@ -594,5 +611,134 @@ async def prune_message_cache(max_rows: int = 5000):
             await db.commit()
     except Exception as e:
         logger.debug(f"Gagal memangkas message cache: {e}")
+
+
+# ─── Channel Mirroring via Webhook Settings ──────────────────────────
+def _row_to_mirror_dict(row: tuple) -> Dict[str, Any]:
+    """Konversi baris SQLite channel_mirrors menjadi dict konfigurasi."""
+    return {
+        "id": row[0],
+        "source_guild_id": row[1],
+        "source_channel_id": row[2],
+        "target_guild_id": row[3],
+        "target_channel_id": row[4],
+        "webhook_url": row[5],
+        "ignore_bots": bool(row[6]),
+        "show_source": bool(row[7]),
+        "enabled": bool(row[8]),
+        "created_by": row[9],
+    }
+
+
+async def add_channel_mirror(
+    source_guild_id: int,
+    source_channel_id: int,
+    target_guild_id: int,
+    target_channel_id: int,
+    webhook_url: str,
+    ignore_bots: bool = True,
+    show_source: bool = False,
+    created_by: Optional[int] = None,
+) -> Optional[int]:
+    """Menambah atau memperbarui aturan mirror antar channel via Webhook."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO channel_mirrors
+                (source_guild_id, source_channel_id, target_guild_id, target_channel_id,
+                 webhook_url, ignore_bots, show_source, enabled, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT(source_channel_id, target_channel_id) DO UPDATE SET
+                    webhook_url = excluded.webhook_url,
+                    ignore_bots = excluded.ignore_bots,
+                    show_source = excluded.show_source,
+                    enabled = 1,
+                    created_by = excluded.created_by
+                """,
+                (
+                    source_guild_id,
+                    source_channel_id,
+                    target_guild_id,
+                    target_channel_id,
+                    webhook_url,
+                    1 if ignore_bots else 0,
+                    1 if show_source else 0,
+                    created_by,
+                ),
+            )
+            await db.commit()
+            async with db.execute(
+                "SELECT id FROM channel_mirrors WHERE source_channel_id = ? AND target_channel_id = ?",
+                (source_channel_id, target_channel_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else None
+    except Exception as e:
+        logger.error(f"Gagal menyimpan channel mirror: {e}")
+        return None
+
+
+async def update_channel_mirror_webhook(mirror_id: int, new_webhook_url: str):
+    """Memperbarui URL webhook jika dibuat ulang secara otomatis."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE channel_mirrors SET webhook_url = ? WHERE id = ?",
+                (new_webhook_url, mirror_id),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Gagal update webhook mirror #{mirror_id}: {e}")
+
+
+async def set_channel_mirror_enabled(mirror_id: int, enabled: bool) -> bool:
+    """Mengaktifkan atau menjeda aturan mirror berdasarkan ID."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "UPDATE channel_mirrors SET enabled = ? WHERE id = ?",
+                (1 if enabled else 0, mirror_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Gagal toggle channel mirror #{mirror_id}: {e}")
+        return False
+
+
+async def remove_channel_mirror(mirror_id: int) -> bool:
+    """Menghapus aturan mirror berdasarkan ID."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "DELETE FROM channel_mirrors WHERE id = ?", (mirror_id,)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"Gagal menghapus channel mirror #{mirror_id}: {e}")
+        return False
+
+
+async def get_all_channel_mirrors() -> List[Dict[str, Any]]:
+    """Mengambil seluruh aturan channel mirror yang tersimpan."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                """
+                SELECT id, source_guild_id, source_channel_id, target_guild_id,
+                       target_channel_id, webhook_url, ignore_bots, show_source,
+                       enabled, created_by
+                FROM channel_mirrors
+                ORDER BY id ASC
+                """
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [_row_to_mirror_dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Gagal memuat channel mirrors: {e}")
+        return []
+
 
 
