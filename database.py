@@ -70,10 +70,18 @@ async def init_db():
                 guild_id INTEGER PRIMARY KEY,
                 log_channel_id INTEGER NOT NULL,
                 log_edits INTEGER DEFAULT 1,
-                ignore_bots INTEGER DEFAULT 1
+                ignore_bots INTEGER DEFAULT 1,
+                tag_on_delete INTEGER DEFAULT 1
             )
             """
         )
+        # Migrasi aman untuk DB yang sudah terlanjur dibuat tanpa kolom tag_on_delete
+        async with db.execute("PRAGMA table_info(message_log_settings)") as cursor:
+            cols = {row[1] for row in await cursor.fetchall()}
+        if "tag_on_delete" not in cols:
+            await db.execute(
+                "ALTER TABLE message_log_settings ADD COLUMN tag_on_delete INTEGER DEFAULT 1"
+            )
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS message_cache (
@@ -388,6 +396,7 @@ async def set_message_log_config(
     log_channel_id: int,
     log_edits: bool = True,
     ignore_bots: bool = True,
+    tag_on_delete: bool = True,
 ):
     """Menyimpan konfigurasi channel log hapus/edit pesan untuk server."""
     try:
@@ -395,10 +404,16 @@ async def set_message_log_config(
             await db.execute(
                 """
                 INSERT OR REPLACE INTO message_log_settings
-                (guild_id, log_channel_id, log_edits, ignore_bots)
-                VALUES (?, ?, ?, ?)
+                (guild_id, log_channel_id, log_edits, ignore_bots, tag_on_delete)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (guild_id, log_channel_id, 1 if log_edits else 0, 1 if ignore_bots else 0),
+                (
+                    guild_id,
+                    log_channel_id,
+                    1 if log_edits else 0,
+                    1 if ignore_bots else 0,
+                    1 if tag_on_delete else 0,
+                ),
             )
             await db.commit()
     except Exception as e:
@@ -424,7 +439,7 @@ async def get_all_message_log_configs() -> Dict[int, Dict[str, Any]]:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
-                "SELECT guild_id, log_channel_id, log_edits, ignore_bots FROM message_log_settings"
+                "SELECT guild_id, log_channel_id, log_edits, ignore_bots, COALESCE(tag_on_delete, 1) FROM message_log_settings"
             ) as cursor:
                 rows = await cursor.fetchall()
                 return {
@@ -433,6 +448,7 @@ async def get_all_message_log_configs() -> Dict[int, Dict[str, Any]]:
                         "log_channel_id": row[1],
                         "log_edits": bool(row[2]),
                         "ignore_bots": bool(row[3]),
+                        "tag_on_delete": bool(row[4]),
                     }
                     for row in rows
                 }

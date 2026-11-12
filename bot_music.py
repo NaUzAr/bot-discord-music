@@ -238,6 +238,7 @@ def _build_log_status_embed(guild: discord.Guild, msg_logger: MessageLogger) -> 
     ch = guild.get_channel(cfg["log_channel_id"])
     ch_display = ch.mention if ch else f"`Channel tidak ditemukan ({cfg['log_channel_id']})`"
     edit_str = "✅ Aktif" if cfg.get("log_edits", True) else "⏹️ Mati"
+    tag_str = "✅ Aktif" if cfg.get("tag_on_delete", True) else "⏹️ Mati"
     bot_str = "✅ Ya (Abaikan Bot)" if cfg.get("ignore_bots", True) else "❌ Tidak (Catat Bot juga)"
     audit_perm = "✅ Aktif" if (guild.me and guild.me.guild_permissions.view_audit_log) else "⚠️ Tidak Ada Izin View Audit Log"
 
@@ -246,6 +247,7 @@ def _build_log_status_embed(guild: discord.Guild, msg_logger: MessageLogger) -> 
         description=(
             f"🟢 **Status:** Aktif\n"
             f"📺 **Channel Log:** {ch_display}\n"
+            f"🗣️ **Tag 'hayo hapus apa':** {tag_str}\n"
             f"✏️ **Log Edit Pesan:** {edit_str}\n"
             f"🤖 **Abaikan Pesan Bot:** {bot_str}\n"
             f"🕵️ **Deteksi Penghapus (Audit Log):** {audit_perm}\n"
@@ -4281,12 +4283,14 @@ loghapus_group = app_commands.Group(
 @loghapus_group.command(name="set", description="📌 Aktifkan dan pilih channel tujuan log hapus pesan")
 @app_commands.describe(
     channel="Channel teks tujuan pengiriman log (misal: #log-delete)",
+    tag_penghapus="Kirim tag '@user hayo hapus apa 👀' di channel tempat pesan dihapus? (default: Ya)",
     log_edit="Juga catat pesan yang diedit Sebelum -> Sesudah? (default: Ya)",
     abaikan_bot="Abaikan pesan dari bot agar log tidak penuh spam? (default: Ya)",
 )
 async def loghapus_set(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
+    tag_penghapus: bool = True,
     log_edit: bool = True,
     abaikan_bot: bool = True,
 ):
@@ -4307,12 +4311,14 @@ async def loghapus_set(
         log_channel_id=channel.id,
         log_edits=log_edit,
         ignore_bots=abaikan_bot,
+        tag_on_delete=tag_penghapus,
     )
 
     embed = styled_embed(
         title="✅ Log Hapus Pesan Aktif",
         description=(
             f"Seluruh pesan yang dihapus di server **{interaction.guild.name}** akan otomatis dicatat ke {channel.mention}.\n\n"
+            f"• **Tag 'hayo hapus apa':** `{'Aktif' if tag_penghapus else 'Mati'}`\n"
             f"• **Log Edit Pesan:** `{'Aktif' if log_edit else 'Mati'}`\n"
             f"• **Abaikan Pesan Bot:** `{'Ya' if abaikan_bot else 'Tidak'}`\n"
             f"• **Cache Persisten:** `Aktif (RAM + SQLite)`"

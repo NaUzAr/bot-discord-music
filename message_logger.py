@@ -64,6 +64,7 @@ class MessageLogger:
         log_channel_id: int,
         log_edits: bool = True,
         ignore_bots: bool = True,
+        tag_on_delete: bool = True,
     ):
         """Simpan dan aktifkan konfigurasi log hapus pesan untuk guild."""
         await database.set_message_log_config(
@@ -71,12 +72,14 @@ class MessageLogger:
             log_channel_id=log_channel_id,
             log_edits=log_edits,
             ignore_bots=ignore_bots,
+            tag_on_delete=tag_on_delete,
         )
         self.configs[guild_id] = {
             "guild_id": guild_id,
             "log_channel_id": log_channel_id,
             "log_edits": log_edits,
             "ignore_bots": ignore_bots,
+            "tag_on_delete": tag_on_delete,
         }
 
     async def disable_config(self, guild_id: int) -> bool:
@@ -297,6 +300,40 @@ class MessageLogger:
             return None
         return log_channel
 
+    async def _send_delete_tag(
+        self,
+        bot: discord.Client,
+        guild: discord.Guild,
+        channel_id: int,
+        target_user_id: Optional[int],
+        cfg: Dict[str, Any],
+    ):
+        """Kirim pesan tag '<@user> hayo hapus apa 👀' di channel asal saat pesan dihapus."""
+        if not cfg.get("tag_on_delete", True) or not target_user_id:
+            return
+        if bot.user and target_user_id == bot.user.id:
+            return
+
+        origin_channel = guild.get_channel(channel_id) or guild.get_thread(channel_id)
+        if origin_channel is None:
+            try:
+                origin_channel = await bot.fetch_channel(channel_id)
+            except Exception:
+                return
+        if not isinstance(origin_channel, (discord.TextChannel, discord.Thread)):
+            return
+        if guild.me and not origin_channel.permissions_for(guild.me).send_messages:
+            return
+
+        try:
+            await origin_channel.send(
+                content=f"<@{target_user_id}> hayo hapus apa 👀",
+                allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=target_user_id)]),
+                silent=False,
+            )
+        except discord.HTTPException as e:
+            logger.debug(f"Gagal mengirim pesan tag hapus di channel {channel_id}: {e}")
+
     async def handle_raw_message_delete(
         self,
         bot: discord.Client,
@@ -324,6 +361,17 @@ class MessageLogger:
             deleter = await self._find_single_deleter(
                 guild, msg_data["author_id"], payload.channel_id
             )
+            tag_target_id = None
+            if deleter and not getattr(deleter, "bot", False):
+                tag_target_id = deleter.id
+            elif not deleter and not msg_data.get("author_is_bot"):
+                tag_target_id = msg_data["author_id"]
+
+            if tag_target_id:
+                asyncio.create_task(
+                    self._send_delete_tag(bot, guild, payload.channel_id, tag_target_id, cfg)
+                )
+
             sent_ts = int(msg_data["created_at"])
             deleter_str = (
                 f"{deleter.mention} (`{deleter}`)"
@@ -404,6 +452,10 @@ class MessageLogger:
 
         # Fallback jika pesan dikirim sebelum fitur aktif / sudah keluar dari cache
         deleter = await self._find_single_deleter(guild, None, payload.channel_id)
+        if deleter and not getattr(deleter, "bot", False):
+            asyncio.create_task(
+                self._send_delete_tag(bot, guild, payload.channel_id, deleter.id, cfg)
+            )
         deleter_line = f"\n**Dihapus oleh (Audit Log):** {deleter.mention} (`{deleter}`)" if deleter else ""
 
         embed = discord.Embed(
