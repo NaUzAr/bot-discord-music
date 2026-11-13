@@ -296,7 +296,7 @@ class MessageLogger:
         if not guild:
             return None
         log_channel = guild.get_channel(cfg["log_channel_id"])
-        if not isinstance(log_channel, (discord.TextChannel, discord.Thread)):
+        if not isinstance(log_channel, (discord.TextChannel, discord.VoiceChannel, discord.Thread)):
             return None
         return log_channel
 
@@ -320,7 +320,7 @@ class MessageLogger:
                 origin_channel = await bot.fetch_channel(channel_id)
             except Exception:
                 return
-        if not isinstance(origin_channel, (discord.TextChannel, discord.Thread)):
+        if not isinstance(origin_channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.Thread)):
             return
         if guild.me and not origin_channel.permissions_for(guild.me).send_messages:
             return

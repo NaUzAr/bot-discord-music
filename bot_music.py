@@ -13,7 +13,7 @@ import asyncio
 import time
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Union
 import shutil
 
 from dotenv import load_dotenv
@@ -205,8 +205,8 @@ def _has_log_admin_perm(member: discord.abc.User) -> bool:
 
 def _validate_log_channel(guild: discord.Guild, channel: Any) -> Optional[str]:
     """Validasi izin bot pada channel log; mengembalikan pesan error atau None jika valid."""
-    if not isinstance(channel, discord.TextChannel):
-        return "❌ Channel tujuan harus berupa Text Channel biasa."
+    if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+        return "❌ Channel tujuan harus berupa Text Channel atau Voice Channel."
     if not guild.me:
         return "❌ Tidak dapat memverifikasi izin bot."
     perms = channel.permissions_for(guild.me)
@@ -260,15 +260,15 @@ def _build_log_status_embed(guild: discord.Guild, msg_logger: MessageLogger) -> 
 
 def _resolve_mirror_channel(
     bot_client: discord.Client,
-    channel_obj: Optional[discord.TextChannel],
+    channel_obj: Optional[Union[discord.TextChannel, discord.VoiceChannel]],
     channel_id_str: Optional[str],
-) -> Optional[discord.TextChannel]:
+) -> Optional[Union[discord.TextChannel, discord.VoiceChannel]]:
     """Resolusi channel baik dari argumen channel langsung maupun string ID."""
     if channel_obj is not None:
         return channel_obj
     if channel_id_str and channel_id_str.strip().isdigit():
         ch = bot_client.get_channel(int(channel_id_str.strip()))
-        if isinstance(ch, discord.TextChannel):
+        if isinstance(ch, (discord.TextChannel, discord.VoiceChannel)):
             return ch
     return None
 
@@ -276,12 +276,12 @@ def _resolve_mirror_channel(
 def _validate_mirror_pair(
     bot_client: "RythmVoiceBot",
     actor: discord.abc.User,
-    source_ch: Optional[discord.TextChannel],
-    target_ch: Optional[discord.TextChannel],
+    source_ch: Optional[Union[discord.TextChannel, discord.VoiceChannel]],
+    target_ch: Optional[Union[discord.TextChannel, discord.VoiceChannel]],
 ) -> Optional[str]:
     """Validasi pasangan channel sumber & tujuan mirror termasuk izin lintas server."""
-    if not isinstance(source_ch, discord.TextChannel) or not isinstance(target_ch, discord.TextChannel):
-        return "❌ Channel sumber dan tujuan harus berupa Text Channel yang dapat diakses bot."
+    if not isinstance(source_ch, (discord.TextChannel, discord.VoiceChannel)) or not isinstance(target_ch, (discord.TextChannel, discord.VoiceChannel)):
+        return "❌ Channel sumber dan tujuan harus berupa Text Channel atau Voice Channel yang dapat diakses bot."
     if source_ch.id == target_ch.id:
         return "❌ Channel sumber dan channel tujuan tidak boleh sama!"
     if bot_client.mirror_manager.has_reverse_mirror(source_ch.id, target_ch.id):
@@ -4467,7 +4467,7 @@ loghapus_group = app_commands.Group(
 )
 async def loghapus_set(
     interaction: discord.Interaction,
-    channel: discord.TextChannel,
+    channel: Union[discord.TextChannel, discord.VoiceChannel],
     tag_penghapus: bool = True,
     log_edit: bool = True,
     abaikan_bot: bool = True,
@@ -4560,7 +4560,7 @@ async def loghapus_test(interaction: discord.Interaction):
         return
 
     target_ch = interaction.guild.get_channel(cfg["log_channel_id"])
-    if not isinstance(target_ch, discord.TextChannel):
+    if not isinstance(target_ch, (discord.TextChannel, discord.VoiceChannel)):
         await interaction.response.send_message("❌ Channel log tidak ditemukan atau sudah dihapus.", ephemeral=True)
         return
 
@@ -4623,8 +4623,8 @@ async def mirror_id_autocomplete(
 )
 async def mirror_add(
     interaction: discord.Interaction,
-    sumber: Optional[discord.TextChannel] = None,
-    tujuan: Optional[discord.TextChannel] = None,
+    sumber: Optional[Union[discord.TextChannel, discord.VoiceChannel]] = None,
+    tujuan: Optional[Union[discord.TextChannel, discord.VoiceChannel]] = None,
     abaikan_bot: bool = True,
     tampilkan_asal: bool = False,
     sumber_id: Optional[str] = None,

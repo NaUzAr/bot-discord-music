@@ -2,7 +2,7 @@ import io
 import re
 import asyncio
 import logging
-from typing import Optional, Dict, Any, List, Set, Callable
+from typing import Optional, Dict, Any, List, Set, Callable, Union
 
 import aiohttp
 import discord
@@ -108,7 +108,7 @@ class ChannelMirrorManager:
         reverse_list = self.mirrors_by_source.get(target_channel_id, [])
         return any(m["target_channel_id"] == source_channel_id for m in reverse_list)
 
-    async def get_or_create_webhook(self, target_channel: discord.TextChannel) -> str:
+    async def get_or_create_webhook(self, target_channel: Union[discord.TextChannel, discord.VoiceChannel]) -> str:
         """Mengambil webhook mirror yang sudah ada di channel tujuan atau membuat baru."""
         existing = await target_channel.webhooks()
         for wh in existing:
@@ -123,8 +123,8 @@ class ChannelMirrorManager:
 
     async def add_mirror(
         self,
-        source_channel: discord.TextChannel,
-        target_channel: discord.TextChannel,
+        source_channel: Union[discord.TextChannel, discord.VoiceChannel],
+        target_channel: Union[discord.TextChannel, discord.VoiceChannel],
         ignore_bots: bool = True,
         show_source: bool = False,
         created_by: Optional[int] = None,
@@ -358,7 +358,7 @@ class ChannelMirrorManager:
         except discord.NotFound:
             # Webhook mungkin terhapus manual -> coba buat ulang otomatis
             target_ch = bot.get_channel(mirror_cfg["target_channel_id"])
-            if not isinstance(target_ch, discord.TextChannel):
+            if not isinstance(target_ch, (discord.TextChannel, discord.VoiceChannel)):
                 logger.warning(f"Target channel mirror #{mirror_cfg['id']} tidak ditemukan; menonaktifkan mirror.")
                 await database.set_channel_mirror_enabled(mirror_cfg["id"], False)
                 await self._refresh_from_db()
